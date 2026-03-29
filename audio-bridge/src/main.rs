@@ -1,20 +1,39 @@
 mod types;
 mod config_reader;
-mod naa6_client;
+mod xml_protocol;
 mod alsa_capture;
-mod format_detector;
-mod backpressure;
+mod ipc_listener;
 mod shutdown;
+mod control_server;
+mod control_client;
+mod http_server;
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use log::{info, warn, error};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use log::{info, error};
 use crate::config_reader::load_config;
-use crate::naa6_client::Naa6Client;
-use crate::alsa_capture::AlsaCaptureReader;
-use crate::format_detector::FormatDetector;
-use crate::backpressure::BackpressureController;
-use crate::shutdown::{ShutdownHandler, run_shutdown_sequence};
+use crate::ipc_listener::start_ipc_listener;
+use crate::shutdown::ShutdownHandler;
+use crate::types::{FormatDescriptor, TrackMetadata};
+use crate::alsa_capture::start_capture;
+use crate::control_server::run_control_server;
+use crate::control_client::run_control_client;
+use crate::http_server::run_http_server;
+
+/// Detect the local IP address on the network toward `hqplayer_host`.
+/// Uses the UDP connect trick — no packets are sent.
+fn detect_local_ip(hqplayer_host: &str) -> String {
+    let target = format!("{}:80", hqplayer_host);
+    if let Ok(socket) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if socket.connect(&target).is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                return addr.ip().to_string();
+            }
+        }
+    }
+    // Fallback
+    "127.0.0.1".to_string()
+}
 
 fn main() {
     // Load configuration
@@ -30,135 +49,92 @@ fn main() {
         .init();
 
     info!("naa6-audio-bridge starting up");
-    info!("Config: outputName={}, alsaDevice={}, hqplayerHost={}:{}, reconnectBackoff={}ms",
-        config.output_name, config.alsa_device,
+    info!(
+        "Config: outputName={}, alsaDevice={}, listenPort={}, hqplayerHost={}:{}, httpPort={}, reconnectBackoff={}ms",
+        config.output_name, config.alsa_device, config.listen_port,
         config.hqplayer_host, config.hqplayer_port,
-        config.reconnect_backoff);
+        config.http_port, config.reconnect_backoff
+    );
 
     // Set up shutdown handler
     let shutdown = ShutdownHandler::new().unwrap_or_else(|e| {
         error!("Failed to register signal handlers: {}", e);
         std::process::exit(1);
     });
+    let stop_flag: Arc<AtomicBool> = shutdown.flag();
 
-    // Set up backpressure controller
-    let backpressure = Arc::new(Mutex::new(BackpressureController::new()));
+    // Detect our local IP for the HTTP stream URL
+    let local_ip = detect_local_ip(&config.hqplayer_host);
+    let stream_token = uuid::Uuid::new_v4().to_string();
+    let stream_url = format!("http://{}:{}/{}/stream.raw", local_ip, config.http_port, stream_token);
+    info!("HTTP stream URL: {}", stream_url);
 
-    // Set up format detector
-    let mut format_detector = FormatDetector::new();
+    // ── Channels ────────────────────────────────────────────────────────────
 
-    // Set up NAA6 client
-    let mut naa6 = Naa6Client::new(config.clone());
+    // IPC metadata channel: ipc_listener → (unused in new arch, kept for future use)
+    let (meta_tx, _meta_rx) = mpsc::channel::<TrackMetadata>();
 
-    // Set up ALSA capture reader
-    let mut alsa = AlsaCaptureReader::new(config.clone(), Arc::clone(&backpressure));
+    // PCM audio channel: alsa_capture → http_server
+    let (pcm_tx, pcm_rx) = mpsc::sync_channel::<Vec<u8>>(64);
 
-    // Open ALSA device
-    if let Err(e) = alsa.open() {
-        error!("Fatal: failed to open ALSA device: {}", e);
-        std::process::exit(1);
-    }
+    // Shared audio format: alsa_capture writes, http_server reads
+    let shared_format = Arc::new(Mutex::new(FormatDescriptor {
+        bits: 16,
+        channels: 2,
+        rate: 44100,
+        netbuftime: "1.5000000000000000".to_string(),
+        stream: "pcm".to_string(),
+    }));
 
-    // Main loop: connect to HQPlayer and forward audio
-    'outer: loop {
-        if shutdown.should_shutdown() {
-            break 'outer;
-        }
+    // PlaylistAdd signal: control_server → control_client
+    let (playlist_tx, playlist_rx) = mpsc::channel::<String>();
 
-        // Connect to HQPlayer
-        if let Err(e) = naa6.connect() {
-            error!("Failed to connect to HQPlayer: {} — retrying in {}ms", e, config.reconnect_backoff);
-            std::thread::sleep(Duration::from_millis(config.reconnect_backoff));
-            continue;
-        }
+    // ── Threads ─────────────────────────────────────────────────────────────
 
-        // Perform handshake with current format
-        let fmt = match alsa.current_format() {
-            Some(f) => f.clone(),
-            None => {
-                warn!("No format detected yet; waiting...");
-                std::thread::sleep(Duration::from_millis(100));
-                continue;
-            }
+    // IPC listener (metadata from roon-metadata-extension)
+    let ipc_socket = config.ipc_socket.clone();
+    std::thread::spawn(move || {
+        start_ipc_listener(&ipc_socket, meta_tx);
+    });
+
+    // ALSA capture → PCM channel
+    {
+        let alsa_device = config.alsa_device.clone();
+        let stop_clone = Arc::clone(&stop_flag);
+        let fmt = FormatDescriptor {
+            bits: 16,
+            channels: 2,
+            rate: 44100,
+            netbuftime: "1.5000000000000000".to_string(),
+            stream: "pcm".to_string(),
         };
-
-        if let Err(e) = naa6.handshake(&fmt) {
-            error!("NAA6 handshake failed: {} — retrying in {}ms", e, config.reconnect_backoff);
-            naa6.disconnect();
-            std::thread::sleep(Duration::from_millis(config.reconnect_backoff));
-            continue;
-        }
-
-        info!("NAA6 session established; forwarding audio");
-
-        // Audio forwarding loop
-        loop {
-            if shutdown.should_shutdown() {
-                break 'outer;
-            }
-
-            // Tick keepalive
-            if let Err(e) = naa6.tick_keepalive() {
-                error!("Keepalive failed: {} — reconnecting", e);
-                naa6.disconnect();
-                break;
-            }
-
-            // Read frames from ALSA
-            match alsa.read_frames() {
-                Ok((bytes, format_changed, new_fmt)) => {
-                    // Handle format change: send format-change message before audio
-                    if format_changed {
-                        if let Some(ref fmt) = new_fmt {
-                            if let Err(e) = naa6.send_format_change(fmt) {
-                                error!("Failed to send format change: {} — reconnecting", e);
-                                naa6.disconnect();
-                                break;
-                            }
-                        }
-                    }
-
-                    // Forward audio bytes
-                    if !bytes.is_empty() {
-                        if let Err(e) = naa6.send_audio(&bytes) {
-                            if e.kind() == std::io::ErrorKind::WouldBlock {
-                                // Backpressure: pause ALSA
-                                if let Ok(mut bp) = backpressure.lock() {
-                                    bp.on_buffer_full();
-                                }
-                                // Wait briefly for socket to drain
-                                std::thread::sleep(Duration::from_millis(10));
-                                if let Ok(mut bp) = backpressure.lock() {
-                                    bp.on_socket_drain();
-                                }
-                            } else {
-                                error!("Failed to send audio: {} — reconnecting", e);
-                                naa6.disconnect();
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("ALSA read error: {} — continuing", e);
-                    // Don't break the session on ALSA errors (Req 2.8)
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
-
-        // Reconnect after backoff
-        if !shutdown.should_shutdown() {
-            warn!("NAA6 connection lost; reconnecting in {}ms", config.reconnect_backoff);
-            std::thread::sleep(Duration::from_millis(config.reconnect_backoff));
-        }
+        std::thread::spawn(move || {
+            start_capture(&alsa_device, &fmt, pcm_tx, stop_clone);
+        });
     }
 
-    // Graceful shutdown
-    info!("Shutdown signal received; starting graceful shutdown");
-    run_shutdown_sequence(
-        || naa6.send_termination(),
-        || naa6.disconnect(),
-        || alsa.close(),
-    );
+    // HTTP Audio Server
+    {
+        let config_clone = config.clone();
+        let stop_clone = Arc::clone(&stop_flag);
+        let fmt_clone = Arc::clone(&shared_format);
+        std::thread::spawn(move || {
+            run_http_server(config_clone, pcm_rx, fmt_clone, stop_clone);
+        });
+    }
+
+    // Control Client (connects to HQPlayer when signalled)
+    {
+        let config_clone = config.clone();
+        let stop_clone = Arc::clone(&stop_flag);
+        std::thread::spawn(move || {
+            run_control_client(config_clone, playlist_rx, stop_clone);
+        });
+    }
+
+    // Control Server (main loop — accepts Roon connections)
+    run_control_server(config, playlist_tx, stream_url, stop_flag);
+
+    info!("naa6-audio-bridge shutting down");
+    std::process::exit(0);
 }

@@ -1,29 +1,20 @@
 import { createConnection, Socket } from 'node:net';
-import type { Config, TrackMetadata, Naa6Frame } from './types';
-import { NAA6_MSG_TYPE, encodeNaa6Frame } from './types';
+import type { Config, TrackMetadata } from './types';
 import type { Logger } from './Logger';
 
-const METADATA_SEND_TIMEOUT_MS = 500;
+const RECONNECT_DELAY_MS = 1000;
 
 /**
- * Metadata field tags for TLV encoding
- */
-const META_TAG = {
-  TITLE: 0x01,
-  ARTIST: 0x02,
-  ALBUM: 0x03,
-  COVER_ART: 0x04,
-} as const;
-
-/**
- * Forwards track metadata to HQPlayer via NAA 6 metadata messages.
- * Connects to naa6-audio-bridge via IPC socket (or directly to HQPlayer).
+ * Forwards track metadata to naa6-audio-bridge via a Unix IPC socket.
+ * Sends newline-delimited JSON: {"title":"...","artist":"...","album":"..."}\n
+ * Reconnects automatically on socket error.
  */
 export class MetadataForwarder {
   private config: Config;
   private logger: Logger;
   private socket: Socket | null = null;
-  private pendingTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private connected = false;
 
   constructor(config: Config, logger: Logger) {
     this.config = config;
@@ -35,74 +26,85 @@ export class MetadataForwarder {
    */
   connect(): void {
     this.logger.info({ ipcSocket: this.config.ipcSocket }, 'MetadataForwarder connecting to IPC socket');
+    this._doConnect();
+  }
+
+  private _doConnect(): void {
+    if (this.socket) {
+      this.socket.destroy();
+      this.socket = null;
+    }
+
     const socket = createConnection(this.config.ipcSocket);
+
+    socket.on('connect', () => {
+      this.connected = true;
+      this.logger.info('MetadataForwarder connected to IPC socket');
+    });
+
     socket.on('error', (err) => {
-      this.logger.warn({ err }, 'MetadataForwarder IPC socket error');
-      this.socket = null;
+      this.connected = false;
+      this.logger.warn({ err }, 'MetadataForwarder IPC socket error; will reconnect');
+      this._scheduleReconnect();
     });
+
     socket.on('close', () => {
-      this.logger.debug('MetadataForwarder IPC socket closed');
-      this.socket = null;
+      this.connected = false;
+      this.logger.debug('MetadataForwarder IPC socket closed; will reconnect');
+      this._scheduleReconnect();
     });
+
     this.socket = socket;
+  }
+
+  private _scheduleReconnect(): void {
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.logger.info('MetadataForwarder reconnecting to IPC socket');
+      this._doConnect();
+    }, RECONNECT_DELAY_MS);
   }
 
   /**
    * Disconnect from the IPC socket
    */
   disconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
     }
-    if (this.pendingTimer) {
-      clearTimeout(this.pendingTimer);
-      this.pendingTimer = null;
-    }
+    this.connected = false;
   }
 
   /**
    * Handle a metadata changed event from RoonExtension.
-   * Sends the NAA 6 metadata message within 500ms.
+   * If no title/artist/album, logs DEBUG and returns without sending.
+   * Serialises {title, artist, album} as JSON + \n and writes to socket.
    */
   onMetadataChanged(metadata: TrackMetadata): void {
-    // Cancel any pending send
-    if (this.pendingTimer) {
-      clearTimeout(this.pendingTimer);
-      this.pendingTimer = null;
-    }
-
-    // Check if there's any metadata to send
-    if (!metadata.title && !metadata.artist && !metadata.album && !metadata.coverArt) {
+    if (!metadata.title && !metadata.artist && !metadata.album) {
       this.logger.debug('No metadata available; skipping transmission');
       return;
     }
 
-    // Send within 500ms
-    this.pendingTimer = setTimeout(() => {
-      this.pendingTimer = null;
-      this.sendMetadata(metadata);
-    }, 0); // Send immediately but asynchronously; deadline is 500ms from event receipt
-  }
+    const payload: { title?: string; artist?: string; album?: string } = {};
+    if (metadata.title) payload.title = metadata.title;
+    if (metadata.artist) payload.artist = metadata.artist;
+    if (metadata.album) payload.album = metadata.album;
 
-  /**
-   * Encode and send a NAA 6 metadata message
-   */
-  sendMetadata(metadata: TrackMetadata): void {
-    const payload = encodeMetadataPayload(metadata, this.logger);
-    const frame: Naa6Frame = {
-      type: NAA6_MSG_TYPE.METADATA,
-      length: payload.length,
-      payload,
-    };
-    const encoded = encodeNaa6Frame(frame);
+    const json = JSON.stringify(payload) + '\n';
 
-    if (!this.socket || this.socket.destroyed) {
+    if (!this.socket || !this.connected || this.socket.destroyed) {
       this.logger.warn('MetadataForwarder: IPC socket not connected; cannot send metadata');
       return;
     }
 
-    this.socket.write(encoded, (err) => {
+    this.socket.write(json, 'utf-8', (err) => {
       if (err) {
         this.logger.warn({ err }, 'MetadataForwarder: failed to send metadata');
       } else {
@@ -113,70 +115,20 @@ export class MetadataForwarder {
 }
 
 /**
- * Encode TrackMetadata into a NAA 6 metadata payload using TLV encoding.
- * Text fields are encoded as UTF-8.
- * Cover art is validated (max 1024×1024) and omitted if unavailable.
+ * Encode TrackMetadata as a JSON string (for testing/verification).
+ * Returns the JSON string without the trailing newline.
  */
-export function encodeMetadataPayload(metadata: TrackMetadata, logger?: Logger): Buffer {
-  const parts: Buffer[] = [];
-
-  function writeField(tag: number, data: Buffer): void {
-    const header = Buffer.allocUnsafe(5);
-    header.writeUInt8(tag, 0);
-    header.writeUInt32LE(data.length, 1);
-    parts.push(header, data);
-  }
-
-  if (metadata.title) {
-    writeField(META_TAG.TITLE, Buffer.from(metadata.title, 'utf-8'));
-  }
-  if (metadata.artist) {
-    writeField(META_TAG.ARTIST, Buffer.from(metadata.artist, 'utf-8'));
-  }
-  if (metadata.album) {
-    writeField(META_TAG.ALBUM, Buffer.from(metadata.album, 'utf-8'));
-  }
-  if (metadata.coverArt) {
-    // Cover art is included as-is; dimension validation would require image parsing
-    // which is out of scope for the wire encoding step
-    writeField(META_TAG.COVER_ART, metadata.coverArt);
-  }
-
-  return Buffer.concat(parts);
+export function encodeMetadataJson(metadata: TrackMetadata): string {
+  const payload: { title?: string; artist?: string; album?: string } = {};
+  if (metadata.title) payload.title = metadata.title;
+  if (metadata.artist) payload.artist = metadata.artist;
+  if (metadata.album) payload.album = metadata.album;
+  return JSON.stringify(payload);
 }
 
 /**
- * Decode a NAA 6 metadata payload back into TrackMetadata (for testing/verification)
+ * Decode a JSON metadata string back into TrackMetadata (for testing/verification).
  */
-export function decodeMetadataPayload(payload: Buffer): TrackMetadata {
-  const metadata: TrackMetadata = {};
-  let offset = 0;
-
-  while (offset < payload.length) {
-    if (offset + 5 > payload.length) break;
-    const tag = payload.readUInt8(offset);
-    const length = payload.readUInt32LE(offset + 1);
-    offset += 5;
-
-    if (offset + length > payload.length) break;
-    const data = payload.subarray(offset, offset + length);
-    offset += length;
-
-    switch (tag) {
-      case META_TAG.TITLE:
-        metadata.title = data.toString('utf-8');
-        break;
-      case META_TAG.ARTIST:
-        metadata.artist = data.toString('utf-8');
-        break;
-      case META_TAG.ALBUM:
-        metadata.album = data.toString('utf-8');
-        break;
-      case META_TAG.COVER_ART:
-        metadata.coverArt = Buffer.from(data);
-        break;
-    }
-  }
-
-  return metadata;
+export function decodeMetadataJson(json: string): TrackMetadata {
+  return JSON.parse(json) as TrackMetadata;
 }

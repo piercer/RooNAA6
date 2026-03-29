@@ -7,8 +7,7 @@ const LOCAL_CONFIG_PATH = './config.json';
 const KNOWN_KEYS: ReadonlySet<string> = new Set([
   'outputName',
   'alsaDevice',
-  'hqplayerHost',
-  'hqplayerPort',
+  'listenPort',
   'reconnectBackoff',
   'logLevel',
   'ipcSocket',
@@ -17,8 +16,7 @@ const KNOWN_KEYS: ReadonlySet<string> = new Set([
 const DEFAULTS: Config = {
   outputName: 'HQPlayer via NAA6',
   alsaDevice: 'hw:Loopback,1,0',
-  hqplayerHost: '127.0.0.1',
-  hqplayerPort: 10700,
+  listenPort: 43210,
   reconnectBackoff: 5000,
   logLevel: 'info',
   ipcSocket: '/run/roon-naa6-bridge/meta.sock',
@@ -57,8 +55,7 @@ export function loadConfig(
   const config: Config = {
     outputName: (parsed['outputName'] as string) ?? DEFAULTS.outputName,
     alsaDevice: (parsed['alsaDevice'] as string) ?? DEFAULTS.alsaDevice,
-    hqplayerHost: (parsed['hqplayerHost'] as string) ?? DEFAULTS.hqplayerHost,
-    hqplayerPort: (parsed['hqplayerPort'] as number) ?? DEFAULTS.hqplayerPort,
+    listenPort: (parsed['listenPort'] as number) ?? DEFAULTS.listenPort,
     reconnectBackoff: (parsed['reconnectBackoff'] as number) ?? DEFAULTS.reconnectBackoff,
     logLevel: (parsed['logLevel'] as 'info' | 'debug') ?? DEFAULTS.logLevel,
     ipcSocket: (parsed['ipcSocket'] as string) ?? DEFAULTS.ipcSocket,
@@ -91,9 +88,9 @@ function validateConfig(
   config: Config,
   errorAndExit: (msg: string) => never
 ): void {
-  if (!Number.isInteger(config.hqplayerPort) || config.hqplayerPort < 1 || config.hqplayerPort > 65535) {
+  if (!Number.isInteger(config.listenPort) || config.listenPort < 1 || config.listenPort > 65535) {
     errorAndExit(
-      `Invalid config value: hqplayerPort=${config.hqplayerPort} is out of range [1, 65535]`
+      `Invalid config value: listenPort=${config.listenPort} is out of range [1, 65535]`
     );
   }
 

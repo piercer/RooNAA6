@@ -35,8 +35,7 @@ describe('ConfigReader', () => {
 
       expect(config.outputName).toBe('HQPlayer via NAA6');
       expect(config.alsaDevice).toBe('hw:Loopback,1,0');
-      expect(config.hqplayerHost).toBe('127.0.0.1');
-      expect(config.hqplayerPort).toBe(10700);
+      expect(config.listenPort).toBe(43210);
       expect(config.reconnectBackoff).toBe(5000);
       expect(config.logLevel).toBe('info');
       expect(config.ipcSocket).toBe('/run/roon-naa6-bridge/meta.sock');
@@ -54,15 +53,14 @@ describe('ConfigReader', () => {
       mockExistsSync.mockReturnValue(true);
       mockReadFileSync.mockReturnValue(JSON.stringify({
         outputName: 'My Bridge',
-        hqplayerHost: '192.168.1.100',
-        hqplayerPort: 10700,
+        listenPort: 43210,
         reconnectBackoff: 3000,
         logLevel: 'debug',
       }));
 
       const config = loadConfig(warn, errorAndExit);
       expect(config.outputName).toBe('My Bridge');
-      expect(config.hqplayerHost).toBe('192.168.1.100');
+      expect(config.listenPort).toBe(43210);
       expect(config.logLevel).toBe('debug');
     });
 
@@ -72,7 +70,7 @@ describe('ConfigReader', () => {
 
       const config = loadConfig(warn, errorAndExit);
       expect(config.outputName).toBe('Test');
-      expect(config.hqplayerPort).toBe(10700);
+      expect(config.listenPort).toBe(43210);
       expect(config.reconnectBackoff).toBe(5000);
     });
 
@@ -100,20 +98,20 @@ describe('ConfigReader', () => {
   });
 
   describe('invalid config values', () => {
-    it('exits non-zero for hqplayerPort = 0', () => {
+    it('exits non-zero for listenPort = 0', () => {
       mockExistsSync.mockReturnValue(true);
-      mockReadFileSync.mockReturnValue(JSON.stringify({ hqplayerPort: 0 }));
+      mockReadFileSync.mockReturnValue(JSON.stringify({ listenPort: 0 }));
 
       expect(() => loadConfig(warn, errorAndExit)).toThrow('exit(1)');
-      expect(errors.some(e => e.includes('hqplayerPort'))).toBe(true);
+      expect(errors.some(e => e.includes('listenPort'))).toBe(true);
     });
 
-    it('exits non-zero for hqplayerPort > 65535', () => {
+    it('exits non-zero for listenPort > 65535', () => {
       mockExistsSync.mockReturnValue(true);
-      mockReadFileSync.mockReturnValue(JSON.stringify({ hqplayerPort: 99999 }));
+      mockReadFileSync.mockReturnValue(JSON.stringify({ listenPort: 99999 }));
 
       expect(() => loadConfig(warn, errorAndExit)).toThrow('exit(1)');
-      expect(errors.some(e => e.includes('hqplayerPort'))).toBe(true);
+      expect(errors.some(e => e.includes('listenPort'))).toBe(true);
     });
 
     it('exits non-zero for reconnectBackoff = 0', () => {

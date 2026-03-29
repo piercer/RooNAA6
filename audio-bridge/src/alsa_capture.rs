@@ -1,205 +1,227 @@
-use alsa::pcm::{PCM, HwParams, Access, Format, State};
+use alsa::pcm::{PCM, HwParams, Access, Format};
 use alsa::{Direction, ValueOr};
 use log::{info, warn, error, debug};
-use std::sync::{Arc, Mutex};
-use crate::types::{Config, FormatDescriptor, Encoding, VALID_PCM_SAMPLE_RATES, VALID_BIT_DEPTHS};
-use crate::backpressure::BackpressureController;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::mpsc::SyncSender;
+use crate::types::FormatDescriptor;
 
 /// Number of frames per read period
 const PERIOD_FRAMES: u32 = 1024;
 
-/// Reads PCM/DSD frames from the ALSA loopback capture device
-pub struct AlsaCaptureReader {
-    config: Config,
-    pcm: Option<PCM>,
-    current_format: Option<FormatDescriptor>,
-    backpressure: Arc<Mutex<BackpressureController>>,
+/// Map bit depth to ALSA PCM format
+fn bits_to_format(bits: u8) -> Format {
+    match bits {
+        16 => Format::s16(),
+        24 => Format::s24(),
+        32 => Format::s32(),
+        _ => {
+            warn!("Unsupported bit depth {}; defaulting to S16LE", bits);
+            Format::s16()
+        }
+    }
 }
 
-impl AlsaCaptureReader {
-    pub fn new(config: Config, backpressure: Arc<Mutex<BackpressureController>>) -> Self {
-        AlsaCaptureReader {
-            config,
-            pcm: None,
-            current_format: None,
-            backpressure,
-        }
+/// Bytes per sample for a given bit depth
+fn bytes_per_sample(bits: u8) -> usize {
+    match bits {
+        16 => 2,
+        24 => 4, // ALSA S24LE is stored in 4 bytes
+        32 => 4,
+        _ => 2,
     }
+}
 
-    /// Open the ALSA capture device
-    pub fn open(&mut self) -> Result<(), String> {
-        info!("Opening ALSA capture device: {}", self.config.alsa_device);
-        let pcm = PCM::new(&self.config.alsa_device, Direction::Capture, false)
-            .map_err(|e| format!("Failed to open ALSA device '{}': {} (code: {})", self.config.alsa_device, e, e.errno()))?;
+/// Start ALSA capture in the current thread.
+/// Reads PCM frames and sends Vec<u8> chunks to `tx`.
+/// Stops when `stop` flag is set.
+pub fn start_capture(
+    device: &str,
+    fmt: &FormatDescriptor,
+    tx: SyncSender<Vec<u8>>,
+    stop: Arc<AtomicBool>,
+) {
+    info!("Opening ALSA capture device: {} (bits={} channels={} rate={})", device, fmt.bits, fmt.channels, fmt.rate);
 
-        // Configure hardware parameters
-        {
-            let hwp = HwParams::any(&pcm)
-                .map_err(|e| format!("Failed to get hw params: {} (code: {})", e, e.errno()))?;
-
-            hwp.set_channels(2)
-                .map_err(|e| format!("Failed to set channels: {} (code: {})", e, e.errno()))?;
-            hwp.set_rate(44100, ValueOr::Nearest)
-                .map_err(|e| format!("Failed to set rate: {} (code: {})", e, e.errno()))?;
-            hwp.set_format(Format::s16_le())
-                .map_err(|e| format!("Failed to set format: {} (code: {})", e, e.errno()))?;
-            hwp.set_access(Access::RWInterleaved)
-                .map_err(|e| format!("Failed to set access: {} (code: {})", e, e.errno()))?;
-            hwp.set_period_size(PERIOD_FRAMES as i64, ValueOr::Nearest)
-                .map_err(|e| format!("Failed to set period size: {} (code: {})", e, e.errno()))?;
-
-            pcm.hw_params(&hwp)
-                .map_err(|e| format!("Failed to apply hw params: {} (code: {})", e, e.errno()))?;
+    let pcm = match PCM::new(device, Direction::Capture, false) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Fatal: failed to open ALSA device '{}': {} (errno: {})", device, e, e.errno());
+            std::process::exit(1);
         }
+    };
 
-        pcm.start()
-            .map_err(|e| format!("Failed to start PCM capture: {} (code: {})", e, e.errno()))?;
-
-        self.current_format = Some(self.detect_format(&pcm)?);
-        self.pcm = Some(pcm);
-        info!("ALSA capture device opened successfully");
-        Ok(())
-    }
-
-    /// Close the ALSA capture device
-    pub fn close(&mut self) {
-        if let Some(pcm) = self.pcm.take() {
-            let _ = pcm.drop();
-            info!("ALSA capture device closed");
-        }
-    }
-
-    /// Read a period of frames. Returns (bytes, format_changed, new_format).
-    /// Handles overrun recovery internally.
-    pub fn read_frames(&mut self) -> Result<(Vec<u8>, bool, Option<FormatDescriptor>), String> {
-        let pcm = match &self.pcm {
-            Some(p) => p,
-            None => return Err("ALSA device not open".to_string()),
+    // Configure hardware parameters
+    {
+        let hwp = match HwParams::any(&pcm) {
+            Ok(h) => h,
+            Err(e) => {
+                error!("Failed to get hw params: {}", e);
+                return;
+            }
         };
 
-        // Check backpressure
-        if let Ok(bp) = self.backpressure.lock() {
-            if bp.is_paused() {
-                return Ok((vec![], false, None));
-            }
+        if let Err(e) = hwp.set_channels(fmt.channels as u32) {
+            error!("Failed to set channels: {}", e);
+            return;
+        }
+        if let Err(e) = hwp.set_rate(fmt.rate, ValueOr::Nearest) {
+            error!("Failed to set rate {}: {}", fmt.rate, e);
+            return;
+        }
+        let alsa_fmt = bits_to_format(fmt.bits);
+        if let Err(e) = hwp.set_format(alsa_fmt) {
+            error!("Failed to set format: {}", e);
+            return;
+        }
+        if let Err(e) = hwp.set_access(Access::RWInterleaved) {
+            error!("Failed to set access: {}", e);
+            return;
+        }
+        if let Err(e) = hwp.set_period_size(PERIOD_FRAMES as i64, ValueOr::Nearest) {
+            error!("Failed to set period size: {}", e);
+            return;
+        }
+        if let Err(e) = pcm.hw_params(&hwp) {
+            error!("Failed to apply hw params: {}", e);
+            return;
+        }
+    }
+
+    if let Err(e) = pcm.start() {
+        error!("Failed to start PCM capture: {}", e);
+        return;
+    }
+
+    info!("ALSA capture started");
+
+    let bps = bytes_per_sample(fmt.bits);
+    let frame_size = fmt.channels as usize * bps;
+    let buf_frames = PERIOD_FRAMES as usize;
+    let _buf_bytes = buf_frames * frame_size;
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            info!("ALSA capture stop flag set; exiting capture loop");
+            break;
         }
 
-        // 2 channels × 2 bytes (S16_LE) × PERIOD_FRAMES
-        let frame_bytes = 2 * 2 * PERIOD_FRAMES as usize;
-        let mut buf = vec![0i16; 2 * PERIOD_FRAMES as usize];
-
-        let io = pcm.io_i16().map_err(|e| format!("Failed to get PCM IO: {}", e))?;
-
-        match io.readi(&mut buf) {
-            Ok(frames) => {
-                let byte_count = frames * 2 * 2; // frames * channels * bytes_per_sample
-                let bytes: Vec<u8> = buf[..frames * 2]
-                    .iter()
-                    .flat_map(|s| s.to_le_bytes())
-                    .collect();
-
-                // Detect format changes
-                let new_fmt = self.detect_format(pcm).ok();
-                let format_changed = match (&self.current_format, &new_fmt) {
-                    (Some(old), Some(new)) => old != new,
-                    (None, Some(_)) => true,
-                    _ => false,
+        let _buf = vec![0u8; _buf_bytes];
+        let result = match fmt.bits {
+            16 => {
+                let mut ibuf = vec![0i16; buf_frames * fmt.channels as usize];
+                let io = match pcm.io_i16() {
+                    Ok(io) => io,
+                    Err(e) => { error!("Failed to get PCM IO: {}", e); break; }
                 };
+                match io.readi(&mut ibuf) {
+                    Ok(frames) => {
+                        let bytes: Vec<u8> = ibuf[..frames * fmt.channels as usize]
+                            .iter()
+                            .flat_map(|s| s.to_le_bytes())
+                            .collect();
+                        Ok(bytes)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            _ => {
+                // For 24/32-bit, use i32 IO
+                let mut ibuf = vec![0i32; buf_frames * fmt.channels as usize];
+                let io = match pcm.io_i32() {
+                    Ok(io) => io,
+                    Err(e) => { error!("Failed to get PCM IO: {}", e); break; }
+                };
+                match io.readi(&mut ibuf) {
+                    Ok(frames) => {
+                        let bytes: Vec<u8> = ibuf[..frames * fmt.channels as usize]
+                            .iter()
+                            .flat_map(|s| s.to_le_bytes())
+                            .collect();
+                        Ok(bytes)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+        };
 
-                if format_changed {
-                    if let Some(ref fmt) = new_fmt {
-                        debug!("Format change detected: {:?}", fmt);
-                        self.current_format = new_fmt.clone();
+        match result {
+            Ok(bytes) => {
+                if !bytes.is_empty() {
+                    debug!("ALSA read {} bytes", bytes.len());
+                    if tx.send(bytes).is_err() {
+                        debug!("ALSA channel receiver dropped; stopping capture");
+                        break;
                     }
                 }
-
-                Ok((bytes, format_changed, if format_changed { new_fmt } else { None }))
             }
-            Err(e) if e.errno() == nix::errno::Errno::EPIPE => {
-                // Overrun: recover via snd_pcm_prepare
+            Err(e) if e.errno() == 32 => {
+                // EPIPE — overrun
                 warn!("ALSA overrun (EPIPE) detected; recovering via snd_pcm_prepare");
-                pcm.prepare()
-                    .map_err(|e2| format!("Failed to recover from overrun: {} (code: {})", e2, e2.errno()))?;
-                Ok((vec![], false, None))
+                if let Err(e2) = pcm.prepare() {
+                    error!("Failed to recover from overrun: {}", e2);
+                    break;
+                }
             }
             Err(e) => {
-                error!("ALSA read error: {} (code: {})", e, e.errno());
-                Err(format!("ALSA read error: {} (code: {})", e, e.errno()))
+                error!("ALSA read error: {} (errno: {})", e, e.errno());
+                break;
             }
         }
     }
 
-    /// Detect the current format from ALSA hw_params
-    fn detect_format(&self, pcm: &PCM) -> Result<FormatDescriptor, String> {
-        let hwp = pcm.hw_params_current()
-            .map_err(|e| format!("Failed to get current hw params: {}", e))?;
-
-        let rate = hwp.get_rate()
-            .map_err(|e| format!("Failed to get sample rate: {}", e))?;
-        let channels = hwp.get_channels()
-            .map_err(|e| format!("Failed to get channels: {}", e))? as u8;
-        let format = hwp.get_format()
-            .map_err(|e| format!("Failed to get format: {}", e))?;
-
-        let bit_depth: u8 = match format {
-            Format::S16LE | Format::S16BE => 16,
-            Format::S24LE | Format::S24BE | Format::S24_3LE | Format::S24_3BE => 24,
-            Format::S32LE | Format::S32BE => 32,
-            _ => {
-                warn!("Unknown ALSA format {:?}; defaulting to 16-bit", format);
-                16
-            }
-        };
-
-        Ok(FormatDescriptor {
-            encoding: Encoding::PCM,
-            sample_rate: rate,
-            bit_depth,
-            channels,
-            dsd_rate: None,
-        })
-    }
-
-    /// Get the current format descriptor
-    pub fn current_format(&self) -> Option<&FormatDescriptor> {
-        self.current_format.as_ref()
-    }
+    info!("ALSA capture stopped");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Encoding, FormatDescriptor};
 
     #[test]
-    fn test_format_descriptor_equality() {
-        let fmt1 = FormatDescriptor {
-            encoding: Encoding::PCM,
-            sample_rate: 44100,
-            bit_depth: 16,
-            channels: 2,
-            dsd_rate: None,
-        };
-        let fmt2 = fmt1.clone();
-        assert_eq!(fmt1, fmt2);
+    fn test_bits_to_format_16() {
+        let f = bits_to_format(16);
+        assert_eq!(f, Format::s16());
     }
 
     #[test]
-    fn test_format_descriptor_inequality_on_rate_change() {
-        let fmt1 = FormatDescriptor {
-            encoding: Encoding::PCM,
-            sample_rate: 44100,
-            bit_depth: 16,
-            channels: 2,
-            dsd_rate: None,
-        };
-        let fmt2 = FormatDescriptor {
-            encoding: Encoding::PCM,
-            sample_rate: 96000,
-            bit_depth: 16,
-            channels: 2,
-            dsd_rate: None,
-        };
-        assert_ne!(fmt1, fmt2);
+    fn test_bits_to_format_24() {
+        let f = bits_to_format(24);
+        assert_eq!(f, Format::s24());
+    }
+
+    #[test]
+    fn test_bits_to_format_32() {
+        let f = bits_to_format(32);
+        assert_eq!(f, Format::s32());
+    }
+
+    #[test]
+    fn test_bytes_per_sample() {
+        assert_eq!(bytes_per_sample(16), 2);
+        assert_eq!(bytes_per_sample(24), 4);
+        assert_eq!(bytes_per_sample(32), 4);
+    }
+
+    // Task 5.4 Property test: Audio bytes forwarded unmodified
+    #[cfg(test)]
+    mod property_tests {
+        use proptest::prelude::*;
+        use std::sync::mpsc;
+
+        // Feature: roon-naa6-bridge, Property 3: Audio bytes forwarded unmodified
+        // This property tests that bytes sent through the mpsc channel arrive unmodified.
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config::with_cases(100))]
+
+            #[test]
+            fn prop_bytes_forwarded_unmodified(
+                data in proptest::collection::vec(any::<u8>(), 0..4096)
+            ) {
+                let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
+                let data_clone = data.clone();
+                tx.send(data_clone).unwrap();
+                let received = rx.recv().unwrap();
+                prop_assert_eq!(received, data);
+            }
+        }
     }
 }

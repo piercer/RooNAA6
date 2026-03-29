@@ -11,8 +11,10 @@ const LOCAL_CONFIG_PATH: &str = "./config.json";
 const KNOWN_KEYS: &[&str] = &[
     "outputName",
     "alsaDevice",
+    "listenPort",
     "hqplayerHost",
     "hqplayerPort",
+    "httpPort",
     "reconnectBackoff",
     "logLevel",
     "ipcSocket",
@@ -49,7 +51,6 @@ fn read_config_file() -> Option<(String, String)> {
 }
 
 fn parse_and_validate(path: &str, content: &str) -> Config {
-    // Parse as generic JSON first to detect unknown keys
     let json: Value = match serde_json::from_str(content) {
         Ok(v) => v,
         Err(e) => {
@@ -67,7 +68,6 @@ fn parse_and_validate(path: &str, content: &str) -> Config {
         }
     }
 
-    // Deserialize into Config struct (applies defaults for missing fields)
     let config: Config = match serde_json::from_value(json) {
         Ok(c) => c,
         Err(e) => {
@@ -81,12 +81,26 @@ fn parse_and_validate(path: &str, content: &str) -> Config {
 }
 
 fn validate_config(config: &Config) {
-    // hqplayerPort is already constrained to u16 (1–65535) by the type system,
-    // but port 0 is invalid.
+    if config.listen_port == 0 {
+        error!(
+            "Invalid config value: listenPort={} is out of range [1, 65535]",
+            config.listen_port
+        );
+        std::process::exit(1);
+    }
+
     if config.hqplayer_port == 0 {
         error!(
             "Invalid config value: hqplayerPort={} is out of range [1, 65535]",
             config.hqplayer_port
+        );
+        std::process::exit(1);
+    }
+
+    if config.http_port == 0 {
+        error!(
+            "Invalid config value: httpPort={} is out of range [1, 65535]",
+            config.http_port
         );
         std::process::exit(1);
     }
@@ -112,8 +126,6 @@ fn validate_config(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     fn parse_config_from_str(content: &str) -> Config {
         let json: Value = serde_json::from_str(content).expect("valid JSON");
@@ -124,18 +136,18 @@ mod tests {
                 }
             }
         }
-        let config: Config = serde_json::from_value(json).expect("valid config");
-        config
+        serde_json::from_value(json).expect("valid config")
     }
 
     #[test]
     fn test_defaults_when_no_file() {
-        // When no config file is present, defaults should be used
         let config = Config::default();
         assert_eq!(config.output_name, "HQPlayer via NAA6");
         assert_eq!(config.alsa_device, "hw:Loopback,1,0");
-        assert_eq!(config.hqplayer_host, "127.0.0.1");
-        assert_eq!(config.hqplayer_port, 10700);
+        assert_eq!(config.listen_port, 4321);
+        assert_eq!(config.hqplayer_host, "192.168.30.212");
+        assert_eq!(config.hqplayer_port, 4321);
+        assert_eq!(config.http_port, 30001);
         assert_eq!(config.reconnect_backoff, 5000);
         assert_eq!(config.log_level, "info");
         assert_eq!(config.ipc_socket, "/run/roon-naa6-bridge/meta.sock");
@@ -146,7 +158,7 @@ mod tests {
         let content = r#"{"outputName": "My Bridge"}"#;
         let config = parse_config_from_str(content);
         assert_eq!(config.output_name, "My Bridge");
-        assert_eq!(config.hqplayer_port, 10700);
+        assert_eq!(config.listen_port, 4321);
         assert_eq!(config.reconnect_backoff, 5000);
     }
 
@@ -155,22 +167,24 @@ mod tests {
         let content = r#"{
             "outputName": "Test Output",
             "alsaDevice": "hw:Loopback,1,0",
-            "hqplayerHost": "192.168.1.100",
-            "hqplayerPort": 10700,
+            "listenPort": 4321,
+            "hqplayerHost": "10.0.0.1",
+            "hqplayerPort": 4321,
+            "httpPort": 30001,
             "reconnectBackoff": 3000,
             "logLevel": "debug"
         }"#;
         let config = parse_config_from_str(content);
         assert_eq!(config.output_name, "Test Output");
-        assert_eq!(config.hqplayer_host, "192.168.1.100");
-        assert_eq!(config.hqplayer_port, 10700);
+        assert_eq!(config.listen_port, 4321);
+        assert_eq!(config.hqplayer_host, "10.0.0.1");
+        assert_eq!(config.http_port, 30001);
         assert_eq!(config.reconnect_backoff, 3000);
         assert_eq!(config.log_level, "debug");
     }
 
     #[test]
     fn test_unknown_keys_do_not_prevent_parsing() {
-        // Unknown keys should be warned about but not cause failure
         let content = r#"{"outputName": "Test", "unknownKey": "value", "anotherUnknown": 42}"#;
         let config = parse_config_from_str(content);
         assert_eq!(config.output_name, "Test");
