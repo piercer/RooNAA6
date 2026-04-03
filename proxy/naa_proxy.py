@@ -42,8 +42,10 @@ def load_cover_art():
     try:
         with open('/tmp/roon_cover.jpg', 'rb') as f:
             data = f.read()
-        if data[:2] == b'\xff\xd8' and len(data) > 100:
+        if data[:2] == b'\xff\xd8' and len(data) > 100 and len(data) <= 80000:
             return data
+        if data[:2] == b'\xff\xd8' and len(data) > 80000:
+            print(f"{ts()} [COVER] skipped: {len(data)}b > 80KB limit", flush=True)
     except (OSError, IOError):
         pass
     return None
@@ -97,15 +99,11 @@ def replace_metadata_section(data, jpeg_data=None):
     if not title:
         return data, False
 
-    # Build metadata-only content (no audio format fields — T8 knows them from start)
-    # Prioritize fitting song > artist > album within target_len
     new_content = f'song={title}\nartist={artist}\nalbum={album}\n'.encode('utf-8')
 
     if len(new_content) > target_len:
-        # Drop album to fit
         new_content = f'song={title}\nartist={artist}\n'.encode('utf-8')
     if len(new_content) > target_len:
-        # Truncate title
         max_title = target_len - len(f'song=\nartist={artist}\n')
         new_content = f'song={title[:max_title]}\nartist={artist}\n'.encode('utf-8')
 
@@ -117,7 +115,7 @@ def replace_metadata_section(data, jpeg_data=None):
         new_content = new_content[:target_len - 1] + b'\n'
 
     before_meta = data[:section_start]
-    after_null = data[section_end + 1:]  # everything after the metadata null
+    after_null = data[section_end + 1:]
 
     if jpeg_data:
         modified = before_meta + new_content + b'\x00' + jpeg_data + after_null
@@ -150,6 +148,8 @@ def forward_hqp_to_t8(src, dst):
     started = False
     injected_count = 0
     header_patched = False
+    last_image_key = None
+    cached_jpeg = None
     try:
         while True:
             data = src.recv(65536)
@@ -163,28 +163,25 @@ def forward_hqp_to_t8(src, dst):
                 header_patched = False
                 injected_count = 0
                 meta = get_roon_metadata()
-                print(f"{ts()} [HQP->T8] start detected — Roon: {meta.get('artist', '?')} - {meta.get('title', '?')}", flush=True)
-
-            if started and not header_patched and len(data) >= 8 and not data.lstrip().startswith(b'<'):
-                # First binary data after start — this contains the frame header
-                # Type byte should have PCM (0x01) and META (0x08) bits set
-                type_byte = data[0]
-                if type_byte & 0x09:  # has PCM and META bits
-                    jpeg_data = load_cover_art()
-                    if jpeg_data:
-                        data = patch_frame_header(data, len(jpeg_data))
-                        print(f"{ts()} [HEADER] patched: type 0x{type_byte:02x}->0x{data[0]:02x}, pic_len={len(jpeg_data)}", flush=True)
-                    header_patched = True
+                # Only load new cover art if image_key changed
+                image_key = meta.get("image_key", "")
+                if image_key and image_key != last_image_key:
+                    last_image_key = image_key
+                    cached_jpeg = load_cover_art()
+                    if cached_jpeg:
+                        print(f"{ts()} [HQP->T8] start: {meta.get('artist', '?')} - {meta.get('title', '?')} (new cover {len(cached_jpeg)}b)", flush=True)
+                    else:
+                        print(f"{ts()} [HQP->T8] start: {meta.get('artist', '?')} - {meta.get('title', '?')} (no cover)", flush=True)
+                else:
+                    print(f"{ts()} [HQP->T8] start: {meta.get('artist', '?')} - {meta.get('title', '?')} (same cover)", flush=True)
 
             if started and b'\x00[metadata]\n' in data:
-                jpeg_data = load_cover_art() if header_patched else None
-                data, did_inject = replace_metadata_section(data, jpeg_data=jpeg_data)
+                data, did_inject = replace_metadata_section(data, jpeg_data=None)
                 if did_inject:
                     injected_count += 1
                     if injected_count <= 3 or injected_count % 50 == 0:
                         meta = get_roon_metadata()
-                        cover_size = len(jpeg_data) if jpeg_data else 0
-                        print(f"{ts()} [INJECT] #{injected_count}: {meta.get('title', '?')} / {meta.get('artist', '?')} + {cover_size}b cover", flush=True)
+                        print(f"{ts()} [INJECT] #{injected_count}: {meta.get('title', '?')} / {meta.get('artist', '?')}", flush=True)
 
             dst.sendall(data)
     except OSError as e:

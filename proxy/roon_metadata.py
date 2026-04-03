@@ -177,7 +177,7 @@ class RoonMetadata:
     def _download_cover(self, image_key):
         """Download cover art from Roon Core and save as JPEG."""
         import urllib.request
-        url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=400&height=400&format=image/jpeg'
+        url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=250&height=250&format=image/jpeg'
         try:
             resp = urllib.request.urlopen(url, timeout=5)
             data = resp.read()
