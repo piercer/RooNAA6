@@ -26,8 +26,12 @@ A thin TCP proxy on port 4321 that:
 
 No ALSA loopback, no HTTP server, no HQPlayer emulation. Audio flows directly from Roon to HQPlayer via the normal secure_uri mechanism.
 
-## Next step: validate the proxy assumption
-Build a **minimal transparent TCP proxy** that forwards every byte between Roon and HQPlayer. If audio plays through to the T8, the simple architecture is viable.
+## Proxy assumption: VALIDATED (2026-04-03)
+A minimal transparent TCP proxy (`proxy/transparent_proxy.py`) was built and tested. Roon pointed at the proxy on the 192.168.30 subnet, proxy forwarded all traffic to HQPlayer at 192.168.30.212:4321. **Audio played perfectly on the T8**, identical to direct HQPlayer connection. Roon's `secure_uri` passes through a proxy without modification.
+
+**The simple architecture is viable. The ALSA loopback approach should be replaced.**
+
+## Next step: build the production Rust proxy
 
 ### Port 4321 challenge
 HQPlayer's NAA control port (4321) **cannot be changed**. So the proxy and HQPlayer must run on different machines (proxy on one machine listening on 4321, forwarding to HQPlayer's real IP:4321).
