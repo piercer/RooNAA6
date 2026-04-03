@@ -37,6 +37,39 @@ def get_roon_metadata():
     except:
         return {}
 
+def load_cover_art():
+    """Read current cover art JPEG from disk. Returns bytes or None."""
+    try:
+        with open('/tmp/roon_cover.jpg', 'rb') as f:
+            data = f.read()
+        if data[:2] == b'\xff\xd8' and len(data) > 100:
+            return data
+    except (OSError, IOError):
+        pass
+    return None
+
+def patch_frame_header(data, jpeg_len):
+    """Patch the NAA v6 frame header to include picture length.
+
+    Frame header format (32 bytes, little-endian):
+      offset 0:  type bitmask (0x01=PCM, 0x04=PIC, 0x08=META, 0x10=POS)
+      offset 4:  PCM data length
+      offset 8:  position section length
+      offset 12: metadata section length
+      offset 16: picture data length
+      offset 20: padding (zeros)
+
+    We need to:
+      - Set PIC bit (0x04) in the type byte
+      - Write JPEG length at offset 16-19
+    """
+    buf = bytearray(data)
+    # Set PIC bit in type byte
+    buf[0] = buf[0] | 0x04
+    # Write picture length
+    struct.pack_into('<I', buf, 16, jpeg_len)
+    return bytes(buf)
+
 def replace_metadata_section(data, jpeg_data=None):
     """Replace [metadata] section content with Roon metadata, keeping exact same byte count.
 
@@ -92,38 +125,31 @@ def replace_metadata_section(data, jpeg_data=None):
         modified = before_meta + new_content + b'\x00' + after_null
     return modified, True
 
-def load_cover_art():
-    """Read current cover art JPEG from disk. Returns bytes or None."""
-    try:
-        with open('/tmp/roon_cover.jpg', 'rb') as f:
-            data = f.read()
-        if data[:2] == b'\xff\xd8' and len(data) > 100:
-            return data
-    except (OSError, IOError):
-        pass
-    return None
-
 def discovery_responder():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", NAA_PORT))
     for addr in MCAST_ADDRS:
-        mreq = struct.pack("4sL", socket.inet_aton(addr), socket.INADDR_ANY)
+        mreq = struct.pack("4s4s", socket.inet_aton(addr), socket.inet_aton("192.168.30.212"))
         try:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
         except OSError:
             pass
+    print(f"{ts()} [discovery] listening on :43210 (mcast on 192.168.30.212)", flush=True)
     while True:
         try:
             data, addr = sock.recvfrom(4096)
+            print(f"{ts()} [discovery] UDP from {addr}: {data[:80]}", flush=True)
             if b"discover" in data and b"network audio" in data:
                 sock.sendto(DISCOVER_RESPONSE, addr)
+                print(f"{ts()} [discovery] responded to {addr}", flush=True)
         except OSError:
             pass
 
 def forward_hqp_to_t8(src, dst):
     started = False
     injected_count = 0
+    header_patched = False
     try:
         while True:
             data = src.recv(65536)
@@ -134,17 +160,31 @@ def forward_hqp_to_t8(src, dst):
 
             if b'type="start"' in data and b'result=' not in data:
                 started = True
+                header_patched = False
+                injected_count = 0
                 meta = get_roon_metadata()
                 print(f"{ts()} [HQP->T8] start detected — Roon: {meta.get('artist', '?')} - {meta.get('title', '?')}", flush=True)
 
+            if started and not header_patched and len(data) >= 8 and not data.lstrip().startswith(b'<'):
+                # First binary data after start — this contains the frame header
+                # Type byte should have PCM (0x01) and META (0x08) bits set
+                type_byte = data[0]
+                if type_byte & 0x09:  # has PCM and META bits
+                    jpeg_data = load_cover_art()
+                    if jpeg_data:
+                        data = patch_frame_header(data, len(jpeg_data))
+                        print(f"{ts()} [HEADER] patched: type 0x{type_byte:02x}->0x{data[0]:02x}, pic_len={len(jpeg_data)}", flush=True)
+                    header_patched = True
+
             if started and b'\x00[metadata]\n' in data:
-                jpeg_data = load_cover_art()
+                jpeg_data = load_cover_art() if header_patched else None
                 data, did_inject = replace_metadata_section(data, jpeg_data=jpeg_data)
                 if did_inject:
                     injected_count += 1
-                    meta = get_roon_metadata()
-                    cover_size = len(jpeg_data) if jpeg_data else 0
-                    print(f"{ts()} [INJECT] #{injected_count}: {meta.get('title', '?')} / {meta.get('artist', '?')} + {cover_size}b cover", flush=True)
+                    if injected_count <= 3 or injected_count % 50 == 0:
+                        meta = get_roon_metadata()
+                        cover_size = len(jpeg_data) if jpeg_data else 0
+                        print(f"{ts()} [INJECT] #{injected_count}: {meta.get('title', '?')} / {meta.get('artist', '?')} + {cover_size}b cover", flush=True)
 
             dst.sendall(data)
     except OSError as e:
@@ -169,7 +209,7 @@ if __name__ == '__main__':
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("0.0.0.0", NAA_PORT))
     listener.listen(5)
-    print(f"{ts()} NAA proxy (Roon metadata): :43210 -> {T8_HOST}:43210", flush=True)
+    print(f"{ts()} NAA proxy (Roon metadata + cover art): :43210 -> {T8_HOST}:43210", flush=True)
 
     while True:
         client, addr = listener.accept()

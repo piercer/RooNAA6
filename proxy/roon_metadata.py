@@ -141,6 +141,12 @@ class RoonMetadata:
                 break
 
     def save_metadata(self, zone, now_playing):
+        zone_name = zone.get("display_name", "unknown")
+
+        # Only track the Einstein zone (Roon -> HQPlayer -> proxy -> T8 pipeline)
+        if zone_name != "Einstein":
+            return
+
         three = now_playing.get("three_line", {})
         two = now_playing.get("two_line", {})
         one = now_playing.get("one_line", {})
@@ -148,7 +154,6 @@ class RoonMetadata:
         title = three.get("line1") or two.get("line1") or one.get("line1", "")
         artist = three.get("line2") or two.get("line2") or ""
         album = three.get("line3") or ""
-        zone_name = zone.get("display_name", "unknown")
         image_key = now_playing.get("image_key", "")
 
         metadata = {
@@ -172,7 +177,7 @@ class RoonMetadata:
     def _download_cover(self, image_key):
         """Download cover art from Roon Core and save as JPEG."""
         import urllib.request
-        url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=100&height=100&format=image/jpeg'
+        url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=400&height=400&format=image/jpeg'
         try:
             resp = urllib.request.urlopen(url, timeout=5)
             data = resp.read()
