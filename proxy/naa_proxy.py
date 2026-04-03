@@ -92,6 +92,17 @@ def replace_metadata_section(data, jpeg_data=None):
         modified = before_meta + new_content + b'\x00' + after_null
     return modified, True
 
+def load_cover_art():
+    """Read current cover art JPEG from disk. Returns bytes or None."""
+    try:
+        with open('/tmp/roon_cover.jpg', 'rb') as f:
+            data = f.read()
+        if data[:2] == b'\xff\xd8' and len(data) > 100:
+            return data
+    except (OSError, IOError):
+        pass
+    return None
+
 def discovery_responder():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -127,30 +138,13 @@ def forward_hqp_to_t8(src, dst):
                 print(f"{ts()} [HQP->T8] start detected — Roon: {meta.get('artist', '?')} - {meta.get('title', '?')}", flush=True)
 
             if started and b'\x00[metadata]\n' in data:
-                data, did_inject = replace_metadata_section(data)
+                jpeg_data = load_cover_art()
+                data, did_inject = replace_metadata_section(data, jpeg_data=jpeg_data)
                 if did_inject:
                     injected_count += 1
                     meta = get_roon_metadata()
-                    cover_size = os.path.getsize('/tmp/roon_cover.jpg') if os.path.exists('/tmp/roon_cover.jpg') else 0
+                    cover_size = len(jpeg_data) if jpeg_data else 0
                     print(f"{ts()} [INJECT] #{injected_count}: {meta.get('title', '?')} / {meta.get('artist', '?')} + {cover_size}b cover", flush=True)
-
-            # Trace: find ALL occurrences of "Roon" in outgoing data
-            if started and injected_count > 0 and injected_count < 10:
-                idx = 0
-                while True:
-                    pos = data.find(b'Roon', idx)
-                    if pos == -1:
-                        break
-                    ctx = data[max(0,pos-20):pos+20]
-                    # Check if it's in text context (not random PCM bytes)
-                    try:
-                        ctx.decode('utf-8')
-                        is_text = True
-                    except:
-                        is_text = False
-                    if is_text:
-                        print(f"{ts()} [ROON-LEAK] @{pos} in {len(data)}b: {ctx!r}", flush=True)
-                    idx = pos + 1
 
             dst.sendall(data)
     except OSError as e:
