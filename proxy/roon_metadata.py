@@ -20,6 +20,7 @@ class RoonMetadata:
         self.ws = None
         self.reqid = 0
         self.callbacks = {}
+        self._last_image_key = None
 
     def send_request(self, name, body=None, cb=None):
         rid = self.reqid
@@ -148,18 +149,38 @@ class RoonMetadata:
         artist = three.get("line2") or two.get("line2") or ""
         album = three.get("line3") or ""
         zone_name = zone.get("display_name", "unknown")
+        image_key = now_playing.get("image_key", "")
 
         metadata = {
             "title": title,
             "artist": artist,
             "album": album,
-            "zone": zone_name
+            "zone": zone_name,
+            "image_key": image_key
         }
+
+        # Download cover art if image_key changed
+        if image_key and image_key != self._last_image_key:
+            self._last_image_key = image_key
+            self._download_cover(image_key)
 
         with open(METADATA_FILE, "w") as f:
             json.dump(metadata, f)
 
-        print(f"[{zone_name}] {artist} — {title} ({album})")
+        print(f"[{zone_name}] {artist} — {title} ({album}) img={image_key[:16] if image_key else 'none'}")
+
+    def _download_cover(self, image_key):
+        """Download cover art from Roon Core and save as JPEG."""
+        import urllib.request
+        url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=100&height=100&format=image/jpeg'
+        try:
+            resp = urllib.request.urlopen(url, timeout=5)
+            data = resp.read()
+            with open('/tmp/roon_cover.jpg', 'wb') as f:
+                f.write(data)
+            print(f"Cover art saved: {len(data)} bytes")
+        except Exception as e:
+            print(f"Cover download failed: {e}")
 
 if __name__ == "__main__":
     rm = RoonMetadata()
