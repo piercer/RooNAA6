@@ -37,8 +37,12 @@ def get_roon_metadata():
     except:
         return {}
 
-def replace_metadata_section(data):
-    """Replace [metadata] section content with Roon metadata, keeping exact same byte count."""
+def replace_metadata_section(data, jpeg_data=None):
+    """Replace [metadata] section content with Roon metadata, keeping exact same byte count.
+
+    If jpeg_data is provided, splice it immediately after the metadata null terminator.
+    When jpeg_data is None, byte count is preserved (backward-compatible behavior).
+    """
     marker = b'\x00[metadata]\n'
     mpos = data.find(marker)
     if mpos == -1:
@@ -79,9 +83,13 @@ def replace_metadata_section(data):
     elif len(new_content) > target_len:
         new_content = new_content[:target_len - 1] + b'\n'
 
-    # TODO: Picture injection — HQPlayer pauses PCM while sending JPEG after metadata.
-    # Need to buffer PCM, send JPEG, then resume PCM. See memory/project_picture_format.md.
-    modified = data[:section_start] + new_content + data[section_end:]
+    before_meta = data[:section_start]
+    after_null = data[section_end + 1:]  # everything after the metadata null
+
+    if jpeg_data:
+        modified = before_meta + new_content + b'\x00' + jpeg_data + after_null
+    else:
+        modified = before_meta + new_content + b'\x00' + after_null
     return modified, True
 
 def discovery_responder():
@@ -101,8 +109,6 @@ def discovery_responder():
                 sock.sendto(DISCOVER_RESPONSE, addr)
         except OSError:
             pass
-
-threading.Thread(target=discovery_responder, daemon=True).start()
 
 def forward_hqp_to_t8(src, dst):
     started = False
@@ -162,24 +168,27 @@ def forward_t8_to_hqp(src, dst):
     except OSError as e:
         print(f"{ts()} [T8->HQP] error: {e}", flush=True)
 
-listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listener.bind(("0.0.0.0", NAA_PORT))
-listener.listen(5)
-print(f"{ts()} NAA proxy (Roon metadata): :43210 -> {T8_HOST}:43210", flush=True)
+if __name__ == '__main__':
+    threading.Thread(target=discovery_responder, daemon=True).start()
 
-while True:
-    client, addr = listener.accept()
-    print(f"{ts()} HQP connected from {addr}", flush=True)
-    try:
-        t8 = socket.create_connection((T8_HOST, NAA_PORT), timeout=5)
-    except Exception as e:
-        print(f"{ts()} T8 connect failed: {e}", flush=True)
-        client.close()
-        continue
-    t1 = threading.Thread(target=forward_hqp_to_t8, args=(client, t8), daemon=True)
-    t2 = threading.Thread(target=forward_t8_to_hqp, args=(t8, client), daemon=True)
-    t1.start(); t2.start()
-    t1.join(); t2.join()
-    client.close(); t8.close()
-    print(f"{ts()} Session ended", flush=True)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", NAA_PORT))
+    listener.listen(5)
+    print(f"{ts()} NAA proxy (Roon metadata): :43210 -> {T8_HOST}:43210", flush=True)
+
+    while True:
+        client, addr = listener.accept()
+        print(f"{ts()} HQP connected from {addr}", flush=True)
+        try:
+            t8 = socket.create_connection((T8_HOST, NAA_PORT), timeout=5)
+        except Exception as e:
+            print(f"{ts()} T8 connect failed: {e}", flush=True)
+            client.close()
+            continue
+        t1 = threading.Thread(target=forward_hqp_to_t8, args=(client, t8), daemon=True)
+        t2 = threading.Thread(target=forward_t8_to_hqp, args=(t8, client), daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        client.close(); t8.close()
+        print(f"{ts()} Session ended", flush=True)
