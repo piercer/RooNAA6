@@ -30,3 +30,41 @@ def forward(src: socket.socket, dst: socket.socket, label: str) -> None:
         pass
     finally:
         src_file.close()
+
+
+def main() -> None:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", LISTEN_PORT))
+    listener.listen(1)
+    print(f"Transparent proxy listening on 0.0.0.0:{LISTEN_PORT} → {HQPLAYER_HOST}:{HQPLAYER_PORT}", flush=True)
+
+    while True:
+        print("Waiting for Roon connection...", flush=True)
+        roon_sock, roon_addr = listener.accept()
+        print(f"Roon connected from {roon_addr}", flush=True)
+
+        try:
+            hqp_sock = socket.create_connection((HQPLAYER_HOST, HQPLAYER_PORT), timeout=10)
+        except OSError as e:
+            print(f"Failed to connect to HQPlayer at {HQPLAYER_HOST}:{HQPLAYER_PORT}: {e}", flush=True)
+            roon_sock.close()
+            continue
+
+        print(f"Connected to HQPlayer at {HQPLAYER_HOST}:{HQPLAYER_PORT}", flush=True)
+
+        t1 = threading.Thread(target=forward, args=(roon_sock, hqp_sock, "Roon→HQP"), daemon=True)
+        t2 = threading.Thread(target=forward, args=(hqp_sock, roon_sock, "HQP→Roon"), daemon=True)
+        t1.start()
+        t2.start()
+
+        t1.join()
+        t2.join()
+
+        roon_sock.close()
+        hqp_sock.close()
+        print("Session ended.", flush=True)
+
+
+if __name__ == "__main__":
+    main()
