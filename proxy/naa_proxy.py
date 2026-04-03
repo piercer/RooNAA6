@@ -79,6 +79,8 @@ def replace_metadata_section(data):
     elif len(new_content) > target_len:
         new_content = new_content[:target_len - 1] + b'\n'
 
+    # TODO: Picture injection — HQPlayer pauses PCM while sending JPEG after metadata.
+    # Need to buffer PCM, send JPEG, then resume PCM. See memory/project_picture_format.md.
     modified = data[:section_start] + new_content + data[section_end:]
     return modified, True
 
@@ -123,7 +125,8 @@ def forward_hqp_to_t8(src, dst):
                 if did_inject:
                     injected_count += 1
                     meta = get_roon_metadata()
-                    print(f"{ts()} [INJECT] #{injected_count}: {meta.get('title', '?')} / {meta.get('artist', '?')} / {meta.get('album', '?')}", flush=True)
+                    cover_size = os.path.getsize('/tmp/roon_cover.jpg') if os.path.exists('/tmp/roon_cover.jpg') else 0
+                    print(f"{ts()} [INJECT] #{injected_count}: {meta.get('title', '?')} / {meta.get('artist', '?')} + {cover_size}b cover", flush=True)
 
             # Trace: find ALL occurrences of "Roon" in outgoing data
             if started and injected_count > 0 and injected_count < 10:
