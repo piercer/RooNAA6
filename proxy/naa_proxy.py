@@ -220,8 +220,19 @@ class RoonMetadata:
         self._last_image_key = None
 
     def send_complete(self, request_id, status="Success"):
-        """Send a MOO/1 COMPLETE response to an incoming request from Roon Core."""
+        """Send a MOO/1 COMPLETE response (terminates the request)."""
         msg = f'MOO/1 COMPLETE {status}\nRequest-Id: {request_id}\n\n'.encode()
+        self.ws.send_binary(msg)
+
+    def send_continue(self, request_id, status="Changed", body=None):
+        """Send a MOO/1 CONTINUE response (keeps the subscription alive)."""
+        header = f'MOO/1 CONTINUE {status}\nRequest-Id: {request_id}\n'
+        if body is not None:
+            content = json.dumps(body).encode('utf-8')
+            header += f'Content-Length: {len(content)}\nContent-Type: application/json\n'
+            msg = header.encode() + b'\n' + content
+        else:
+            msg = (header + '\n').encode()
         self.ws.send_binary(msg)
 
     def send_request(self, name, body=None, cb=None):
@@ -270,7 +281,8 @@ class RoonMetadata:
         self.send_request("com.roonlabs.registry:1/info")
         resp = self.ws.recv()
         first, headers, body = self.parse_response(resp)
-        print(f"{ts()} [roon] core: {body.get('display_name', '?')} v{body.get('display_version', '?')}", flush=True)
+        self._core_id = body.get('core_id', '') if isinstance(body, dict) else ''
+        print(f"{ts()} [roon] core: {body.get('display_name', '?')} v{body.get('display_version', '?')} id={self._core_id[:16]}", flush=True)
 
         token = None
         if os.path.exists(TOKEN_FILE):
@@ -283,7 +295,7 @@ class RoonMetadata:
             "display_version": "1.0.0",
             "publisher": "RooNAA6",
             "email": "noreply@example.com",
-            "provided_services": ["com.roonlabs.ping:1"],
+            "provided_services": ["com.roonlabs.pairing:1", "com.roonlabs.ping:1"],
             "required_services": ["com.roonlabs.transport:2"],
             "optional_services": [],
             "website": ""
@@ -301,11 +313,14 @@ class RoonMetadata:
                 first, headers, body = self.parse_response(resp)
                 if first is None:
                     continue
-                # Handle incoming REQUESTs from Roon Core (e.g. ping)
-                if first and first.startswith('MOO/1 REQUEST'):
+                # Handle incoming REQUESTs from Roon Core (ping, pairing)
+                if first.startswith('MOO/1 REQUEST'):
                     rid = headers.get('Request-Id')
                     if rid is not None:
-                        self.send_complete(rid)
+                        if 'subscribe_pairing' in first:
+                            self.send_continue(rid, "Changed", {"paired_core_id": self._core_id})
+                        else:
+                            self.send_complete(rid)
                     continue
                 if body and isinstance(body, dict):
                     if "token" in body:
