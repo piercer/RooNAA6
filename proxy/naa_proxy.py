@@ -8,16 +8,10 @@ except ImportError:
 
 T8_HOST = "192.168.30.109"
 NAA_PORT = 43210
+METADATA_FILE = "/tmp/roon_now_playing.json"
 ROON_HOST = "192.168.30.23"
 ROON_PORT = 9330
 TOKEN_FILE = "/tmp/roon_token.json"
-
-# Shared metadata state (written by Roon listener thread, read by proxy)
-_metadata = {}
-_cover_art = None
-_meta_lock = threading.Lock()
-_meta_version = 0
-_force_roon_reconnect = threading.Event()
 
 DISCOVER_RESPONSE = (
     '<?xml version="1.0" encoding="utf-8"?>'
@@ -45,43 +39,23 @@ def log_xml(label, data):
         pass
 
 def get_roon_metadata():
-    """Read current track metadata from shared state (set by Roon listener thread)."""
-    with _meta_lock:
-        return dict(_metadata)
+    """Read current track metadata from Roon metadata listener."""
+    try:
+        with open(METADATA_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
 
 def load_cover_art():
-    """Read current cover art JPEG from shared state. Returns bytes or None."""
-    with _meta_lock:
-        data = _cover_art
-    if data and data[:2] == b'\xff\xd8' and 100 < len(data) <= 80000:
-        return data
-    if data and data[:2] == b'\xff\xd8' and len(data) > 80000:
-        print(f"{ts()} [COVER] skipped: {len(data)}b > 80KB limit", flush=True)
+    """Read current cover art JPEG from disk. Returns bytes or None."""
+    try:
+        with open('/tmp/roon_cover.jpg', 'rb') as f:
+            data = f.read()
+        if data[:2] == b'\xff\xd8' and len(data) > 100:
+            return data
+    except (OSError, IOError):
+        pass
     return None
-
-_expand_log_count = 0
-_merge_log_count = 0
-
-def find_frame_header(data, meta_marker_pos):
-    """Find the 32-byte NAA v6 frame header for the frame containing metadata.
-
-    Searches backward from the metadata marker, validating each candidate
-    by checking that header + PCM_LEN + POS_LEN points to the marker position.
-    """
-    for offset in range(32, min(meta_marker_pos + 1, 70000)):
-        h = meta_marker_pos - offset
-        if h < 0:
-            break
-        type_byte = data[h]
-        if not (type_byte & 0x08) or (type_byte & ~0x1D):
-            continue
-        pcm_len = struct.unpack_from('<I', data, h + 4)[0]
-        pos_len = struct.unpack_from('<I', data, h + 8)[0]
-        if h + 32 + pcm_len + pos_len == meta_marker_pos:
-            meta_len = struct.unpack_from('<I', data, h + 12)[0]
-            pic_len = struct.unpack_from('<I', data, h + 16)[0]
-            return h, pcm_len, pos_len, meta_len, pic_len
-    return -1, 0, 0, 0, 0
 
 def patch_frame_header(data, jpeg_len):
     """Patch the NAA v6 frame header to include picture length.
@@ -132,14 +106,17 @@ def replace_metadata_section(data, jpeg_data=None):
     if not title:
         return data, False
 
-    print(f"{ts()} [META] target_len={target_len}, title='{title}', artist='{artist}'", flush=True)
-
+    # Build metadata-only content (no audio format fields — T8 knows them from start)
+    # Prioritize fitting song > artist > album within target_len
     new_content = f'song={title}\nartist={artist}\nalbum={album}\n'.encode('utf-8')
 
     if len(new_content) > target_len:
+        # Drop album to fit
         new_content = f'song={title}\nartist={artist}\n'.encode('utf-8')
     if len(new_content) > target_len:
-        new_content = f'song={title}\n'.encode('utf-8')
+        # Truncate title
+        max_title = target_len - len(f'song=\nartist={artist}\n')
+        new_content = f'song={title[:max_title]}\nartist={artist}\n'.encode('utf-8')
 
     # Pad to exact target length
     if len(new_content) < target_len:
@@ -149,158 +126,13 @@ def replace_metadata_section(data, jpeg_data=None):
         new_content = new_content[:target_len - 1] + b'\n'
 
     before_meta = data[:section_start]
-    after_null = data[section_end + 1:]
+    after_null = data[section_end + 1:]  # everything after the metadata null
 
     if jpeg_data:
         modified = before_meta + new_content + b'\x00' + jpeg_data + after_null
     else:
         modified = before_meta + new_content + b'\x00' + after_null
     return modified, True
-
-def merge_metadata_section(data, jpeg_data=None):
-    """Merge Roon metadata into [metadata] section, preserving original fields (bitrate, bits, etc.).
-
-    Unlike replace_metadata_section which replaces ALL fields, this keeps the original
-    audio format fields and only overrides song/artist/album. Same byte count output.
-    """
-    global _merge_log_count
-    marker = b'\x00[metadata]\n'
-    mpos = data.find(marker)
-    if mpos == -1:
-        return data, False
-
-    section_start = mpos + len(marker)
-    section_end = data.find(b'\x00', section_start)
-    if section_end == -1:
-        return data, False
-
-    target_len = section_end - section_start
-    original_content = data[section_start:section_end]
-
-    meta = get_roon_metadata()
-    title = meta.get("title", "")
-    if not title:
-        return data, False
-
-    artist = meta.get("artist", "")
-    album = meta.get("album", "")
-
-    # Parse original key=value pairs (preserves order)
-    merged = {}
-    for line in original_content.decode('utf-8', errors='replace').split('\n'):
-        if '=' in line:
-            key, val = line.split('=', 1)
-            merged[key] = val
-
-    _merge_log_count += 1
-    if _merge_log_count <= 3:
-        print(f"{ts()} [META] original fields: {list(merged.items())}", flush=True)
-
-    # Override with Roon metadata
-    merged['song'] = title
-    if artist:
-        merged['artist'] = artist
-    if album:
-        merged['album'] = album
-
-    # Serialize — try full merge first, then drop fields to fit
-    new_content = ''.join(f'{k}={v}\n' for k, v in merged.items()).encode('utf-8')
-
-    if len(new_content) > target_len:
-        # Drop album to save space
-        trimmed = {k: v for k, v in merged.items() if k != 'album'}
-        new_content = ''.join(f'{k}={v}\n' for k, v in trimmed.items()).encode('utf-8')
-
-    if len(new_content) > target_len:
-        # Drop artist too
-        trimmed = {k: v for k, v in trimmed.items() if k != 'artist'}
-        new_content = ''.join(f'{k}={v}\n' for k, v in trimmed.items()).encode('utf-8')
-
-    if len(new_content) > target_len:
-        # Truncate title as last resort
-        avail = target_len - len(new_content) + len(title.encode('utf-8'))
-        if avail > 10:
-            trimmed['song'] = title[:avail - 3] + '...'
-        else:
-            trimmed['song'] = title[:avail]
-        new_content = ''.join(f'{k}={v}\n' for k, v in trimmed.items()).encode('utf-8')
-
-    if len(new_content) > target_len:
-        new_content = new_content[:target_len - 1] + b'\n'
-
-    # Pad to exact target length
-    if len(new_content) < target_len:
-        padding = target_len - len(new_content)
-        new_content = new_content[:-1] + b' ' * padding + b'\n'
-
-    if _merge_log_count <= 5:
-        print(f"{ts()} [META] merge: {target_len}b, title='{title}', artist='{artist}'", flush=True)
-
-    before_meta = data[:section_start]
-    after_null = data[section_end + 1:]
-
-    if jpeg_data:
-        modified = before_meta + new_content + b'\x00' + jpeg_data + after_null
-    else:
-        modified = before_meta + new_content + b'\x00' + after_null
-    return modified, True
-
-
-def process_frame(frame, pcm_len, pos_len, meta_len, pic_len):
-    """Process a complete NAA v6 frame: replace metadata with Roon data.
-
-    Since we have the complete frame, the header is at offset 0 and we can
-    update META_LEN directly after expanding the metadata section.
-    """
-    global _expand_log_count
-    meta_offset = 32 + pcm_len + pos_len
-
-    marker = b'\x00[metadata]\n'
-    if frame[meta_offset:meta_offset + len(marker)] != marker:
-        return frame, False
-
-    section_start = meta_offset + len(marker)
-    # Null separator is at meta_offset + meta_len (just after META section, not counted in meta_len)
-    section_end = meta_offset + meta_len
-    if section_end >= len(frame) or frame[section_end] != 0x00:
-        return frame, False
-
-    original_content = frame[section_start:section_end]
-    old_len = len(original_content)
-
-    # Parse original key=value pairs (preserves order in Python 3.7+)
-    merged = {}
-    for line in original_content.decode('utf-8', errors='replace').split('\n'):
-        if '=' in line:
-            key, val = line.split('=', 1)
-            merged[key] = val
-
-    meta = get_roon_metadata()
-    title = meta.get("title", "")
-    if not title:
-        return frame, False
-
-    merged['song'] = title
-    artist = meta.get("artist", "")
-    album = meta.get("album", "")
-    if artist:
-        merged['artist'] = artist
-    if album:
-        merged['album'] = album
-
-    new_content = ''.join(f'{k}={v}\n' for k, v in merged.items()).encode('utf-8')
-    size_diff = len(new_content) - old_len
-
-    # Rebuild frame with new metadata
-    new_frame = bytearray(frame[:section_start] + new_content + frame[section_end:])
-
-    # Update META_LEN in header (offset 12)
-    struct.pack_into('<I', new_frame, 12, meta_len + size_diff)
-
-    _expand_log_count += 1
-    if _expand_log_count <= 5:
-        print(f"{ts()} [META] {old_len}→{len(new_content)}b, meta_len {meta_len}→{meta_len + size_diff}, keys={list(merged.keys())}", flush=True)
-    return bytes(new_frame), True
 
 def discovery_responder():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -326,9 +158,7 @@ def discovery_responder():
 def forward_hqp_to_t8(src, dst):
     started = False
     injected_count = 0
-    last_image_key = None
-    cached_jpeg = None
-    start_meta_version = 0
+    header_patched = False
     try:
         while True:
             data = src.recv(65536)
@@ -339,34 +169,31 @@ def forward_hqp_to_t8(src, dst):
 
             if b'type="start"' in data and b'result=' not in data:
                 started = True
+                header_patched = False
                 injected_count = 0
-                # Force Roon reconnect for fresh metadata
-                with _meta_lock:
-                    start_meta_version = _meta_version
-                _force_roon_reconnect.set()
                 meta = get_roon_metadata()
-                image_key = meta.get("image_key", "")
-                if image_key and image_key != last_image_key:
-                    last_image_key = image_key
-                    cached_jpeg = load_cover_art()
-                art_info = f"cover {len(cached_jpeg)}b" if cached_jpeg else "no cover"
-                print(f"{ts()} [HQP->T8] start: {meta.get('artist', '?')} - {meta.get('title', '?')} ({art_info})", flush=True)
+                print(f"{ts()} [HQP->T8] start detected — Roon: {meta.get('artist', '?')} - {meta.get('title', '?')}", flush=True)
+
+            if started and not header_patched and len(data) >= 8 and not data.lstrip().startswith(b'<'):
+                # First binary data after start — this contains the frame header
+                # Type byte should have PCM (0x01) and META (0x08) bits set
+                type_byte = data[0]
+                if type_byte & 0x09:  # has PCM and META bits
+                    jpeg_data = load_cover_art()
+                    if jpeg_data:
+                        data = patch_frame_header(data, len(jpeg_data))
+                        print(f"{ts()} [HEADER] patched: type 0x{type_byte:02x}->0x{data[0]:02x}, pic_len={len(jpeg_data)}", flush=True)
+                    header_patched = True
 
             if started and b'\x00[metadata]\n' in data:
-                # Wait for fresh metadata from Roon (up to 1.5s)
-                deadline = time.time() + 1.5
-                while time.time() < deadline:
-                    with _meta_lock:
-                        if _meta_version > start_meta_version:
-                            break
-                    time.sleep(0.05)
-                with _meta_lock:
-                    got_fresh = _meta_version > start_meta_version
-                meta = get_roon_metadata()
-                data, did_inject = replace_metadata_section(data, jpeg_data=None)
+                jpeg_data = load_cover_art() if header_patched else None
+                data, did_inject = replace_metadata_section(data, jpeg_data=jpeg_data)
                 if did_inject:
                     injected_count += 1
-                    print(f"{ts()} [INJECT] #{injected_count} fresh={'Y' if got_fresh else 'N'}: {meta.get('title', '?')} / {meta.get('artist', '?')}", flush=True)
+                    if injected_count <= 3 or injected_count % 50 == 0:
+                        meta = get_roon_metadata()
+                        cover_size = len(jpeg_data) if jpeg_data else 0
+                        print(f"{ts()} [INJECT] #{injected_count}: {meta.get('title', '?')} / {meta.get('artist', '?')} + {cover_size}b cover", flush=True)
 
             dst.sendall(data)
     except OSError as e:
@@ -385,7 +212,7 @@ def forward_t8_to_hqp(src, dst):
         print(f"{ts()} [T8->HQP] error: {e}", flush=True)
 
 class RoonMetadata:
-    """Connects to Roon Core WebSocket, subscribes to transport, updates shared metadata."""
+    """Connects to Roon Core WebSocket, subscribes to transport, writes metadata to disk."""
     def __init__(self):
         self.ws = None
         self.reqid = 0
@@ -462,14 +289,11 @@ class RoonMetadata:
         self.send_request("com.roonlabs.registry:1/register", reg_info)
         print(f"{ts()} [roon] registration sent", flush=True)
 
-        self.ws.settimeout(1)
-        _ka_count = 0
+        self.ws.settimeout(60)
         while True:
             try:
                 resp = self.ws.recv()
                 first, headers, body = self.parse_response(resp)
-                if first:
-                    print(f"{ts()} [roon] <<< {first[:80]}", flush=True)
                 if first is None:
                     continue
                 if body and isinstance(body, dict):
@@ -486,17 +310,12 @@ class RoonMetadata:
                             if np:
                                 self._save_metadata(zone, np)
             except websocket.WebSocketTimeoutException:
-                if _force_roon_reconnect.is_set():
-                    _force_roon_reconnect.clear()
-                    print(f"{ts()} [roon] force reconnect requested", flush=True)
-                    break
                 continue
             except Exception as e:
                 print(f"{ts()} [roon] error: {e}", flush=True)
                 break
 
     def _save_metadata(self, zone, now_playing):
-        global _cover_art, _meta_version
         zone_name = zone.get("display_name", "unknown")
         if zone_name != "Einstein":
             return
@@ -508,30 +327,31 @@ class RoonMetadata:
         album = three.get("line3") or ""
         image_key = now_playing.get("image_key", "")
 
-        with _meta_lock:
-            _metadata.update({
-                "title": title, "artist": artist, "album": album,
-                "zone": zone_name, "image_key": image_key
-            })
-            _meta_version += 1
+        metadata = {
+            "title": title, "artist": artist, "album": album,
+            "zone": zone_name, "image_key": image_key
+        }
 
         if image_key and image_key != self._last_image_key:
             self._last_image_key = image_key
             self._download_cover(image_key)
 
+        with open(METADATA_FILE, "w") as f:
+            json.dump(metadata, f)
+
         print(f"{ts()} [roon] {artist} — {title} ({album})", flush=True)
 
     def _download_cover(self, image_key):
-        global _cover_art
         url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=250&height=250&format=image/jpeg'
         try:
             resp = urllib.request.urlopen(url, timeout=5)
             data = resp.read()
-            with _meta_lock:
-                _cover_art = data
+            with open('/tmp/roon_cover.jpg', 'wb') as f:
+                f.write(data)
             print(f"{ts()} [roon] cover art: {len(data)}b", flush=True)
         except Exception as e:
             print(f"{ts()} [roon] cover download failed: {e}", flush=True)
+
 
 def roon_listener_thread():
     """Roon metadata listener with auto-reconnect. Runs as daemon thread."""
@@ -541,8 +361,8 @@ def roon_listener_thread():
             rm.run()
         except Exception as e:
             print(f"{ts()} [roon] connection error: {e}", flush=True)
-        print(f"{ts()} [roon] reconnecting in 0.5s...", flush=True)
-        time.sleep(0.5)
+        print(f"{ts()} [roon] reconnecting in 5s...", flush=True)
+        time.sleep(5)
 
 if __name__ == '__main__':
     if websocket:
