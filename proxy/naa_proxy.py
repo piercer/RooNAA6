@@ -8,7 +8,6 @@ except ImportError:
 
 T8_HOST = "192.168.30.109"
 NAA_PORT = 43210
-METADATA_FILE = "/tmp/roon_now_playing.json"
 ROON_HOST = "192.168.30.23"
 ROON_PORT = 9330
 TOKEN_FILE = "/tmp/roon_token.json"
@@ -23,6 +22,11 @@ DISCOVER_RESPONSE = (
 ).encode("utf-8")
 
 MCAST_ADDRS = ["224.0.0.199", "239.192.0.199"]
+
+# Shared in-memory state between Roon listener thread and proxy thread
+_metadata = {}
+_cover_art = None
+_meta_lock = threading.Lock()
 
 def ts():
     return datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -39,23 +43,14 @@ def log_xml(label, data):
         pass
 
 def get_roon_metadata():
-    """Read current track metadata from Roon metadata listener."""
-    try:
-        with open(METADATA_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {}
+    """Read current track metadata from shared state."""
+    with _meta_lock:
+        return dict(_metadata)
 
 def load_cover_art():
-    """Read current cover art JPEG from disk. Returns bytes or None."""
-    try:
-        with open('/tmp/roon_cover.jpg', 'rb') as f:
-            data = f.read()
-        if data[:2] == b'\xff\xd8' and len(data) > 100:
-            return data
-    except (OSError, IOError):
-        pass
-    return None
+    """Read current cover art JPEG from shared state. Returns bytes or None."""
+    with _meta_lock:
+        return _cover_art
 
 def patch_frame_header(data, jpeg_len):
     """Patch the NAA v6 frame header to include picture length.
@@ -362,18 +357,21 @@ class RoonMetadata:
             self._last_image_key = image_key
             self._download_cover(image_key)
 
-        with open(METADATA_FILE, "w") as f:
-            json.dump(metadata, f)
+        with _meta_lock:
+            _metadata.clear()
+            _metadata.update(metadata)
 
         print(f"{ts()} [roon] {artist} — {title} ({album})", flush=True)
 
     def _download_cover(self, image_key):
+        global _cover_art
         url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=250&height=250&format=image/jpeg'
         try:
             resp = urllib.request.urlopen(url, timeout=5)
             data = resp.read()
-            with open('/tmp/roon_cover.jpg', 'wb') as f:
-                f.write(data)
+            if data[:2] == b'\xff\xd8' and len(data) > 100:
+                with _meta_lock:
+                    _cover_art = data
             print(f"{ts()} [roon] cover art: {len(data)}b", flush=True)
         except Exception as e:
             print(f"{ts()} [roon] cover download failed: {e}", flush=True)
