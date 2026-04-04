@@ -365,6 +365,11 @@ def roon_listener_thread():
         time.sleep(5)
 
 if __name__ == '__main__':
+    if websocket:
+        threading.Thread(target=roon_listener_thread, daemon=True).start()
+    else:
+        print(f"{ts()} WARNING: websocket-client not installed, Roon metadata disabled", flush=True)
+
     threading.Thread(target=discovery_responder, daemon=True).start()
 
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
