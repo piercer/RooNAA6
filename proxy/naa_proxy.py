@@ -342,7 +342,7 @@ class RoonMetadata:
         print(f"{ts()} [roon] {artist} — {title} ({album})", flush=True)
 
     def _download_cover(self, image_key):
-        url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=400&height=400&format=image/jpeg'
+        url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=250&height=250&format=image/jpeg'
         try:
             resp = urllib.request.urlopen(url, timeout=5)
             data = resp.read()
