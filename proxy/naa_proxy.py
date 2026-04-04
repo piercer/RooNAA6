@@ -1,8 +1,17 @@
-import socket, threading, datetime, struct, os, json
+import socket, threading, datetime, struct, os, json, sys, time
+sys.path.insert(0, os.path.expanduser('~/.local/lib/python3'))
+import urllib.request
+try:
+    import websocket
+except ImportError:
+    websocket = None
 
 T8_HOST = "192.168.30.109"
 NAA_PORT = 43210
 METADATA_FILE = "/tmp/roon_now_playing.json"
+ROON_HOST = "192.168.30.23"
+ROON_PORT = 9330
+TOKEN_FILE = "/tmp/roon_token.json"
 
 DISCOVER_RESPONSE = (
     '<?xml version="1.0" encoding="utf-8"?>'
