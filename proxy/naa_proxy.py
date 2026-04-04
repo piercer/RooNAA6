@@ -219,6 +219,11 @@ class RoonMetadata:
         self.callbacks = {}
         self._last_image_key = None
 
+    def send_complete(self, request_id, status="Success"):
+        """Send a MOO/1 COMPLETE response to an incoming request from Roon Core."""
+        msg = f'MOO/1 COMPLETE {status}\nRequest-Id: {request_id}\n\n'.encode()
+        self.ws.send_binary(msg)
+
     def send_request(self, name, body=None, cb=None):
         rid = self.reqid
         self.reqid += 1
@@ -278,7 +283,7 @@ class RoonMetadata:
             "display_version": "1.0.0",
             "publisher": "RooNAA6",
             "email": "noreply@example.com",
-            "provided_services": [],
+            "provided_services": ["com.roonlabs.ping:1"],
             "required_services": ["com.roonlabs.transport:2"],
             "optional_services": [],
             "website": ""
@@ -295,6 +300,12 @@ class RoonMetadata:
                 resp = self.ws.recv()
                 first, headers, body = self.parse_response(resp)
                 if first is None:
+                    continue
+                # Handle incoming REQUESTs from Roon Core (e.g. ping)
+                if first and first.startswith('MOO/1 REQUEST'):
+                    rid = headers.get('Request-Id')
+                    if rid is not None:
+                        self.send_complete(rid)
                     continue
                 if body and isinstance(body, dict):
                     if "token" in body:
