@@ -211,6 +211,159 @@ def forward_t8_to_hqp(src, dst):
     except OSError as e:
         print(f"{ts()} [T8->HQP] error: {e}", flush=True)
 
+class RoonMetadata:
+    """Connects to Roon Core WebSocket, subscribes to transport, writes metadata to disk."""
+    def __init__(self):
+        self.ws = None
+        self.reqid = 0
+        self.callbacks = {}
+        self._last_image_key = None
+
+    def send_request(self, name, body=None, cb=None):
+        rid = self.reqid
+        self.reqid += 1
+        header = f'MOO/1 REQUEST {name}\nRequest-Id: {rid}\n'
+        if body is not None:
+            content = json.dumps(body).encode('utf-8')
+            header += f'Content-Length: {len(content)}\nContent-Type: application/json\n'
+            msg = header.encode() + b'\n' + content
+        else:
+            msg = (header + '\n').encode()
+        if cb:
+            self.callbacks[rid] = cb
+        self.ws.send_binary(msg)
+        return rid
+
+    def parse_response(self, data):
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        sep = data.find(b'\n\n')
+        if sep == -1:
+            return None, None, None
+        header_part = data[:sep].decode('utf-8')
+        body_part = data[sep+2:]
+        lines = header_part.split('\n')
+        first_line = lines[0]
+        headers = {}
+        for line in lines[1:]:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip()] = v.strip()
+        body = None
+        if body_part:
+            try:
+                body = json.loads(body_part)
+            except:
+                body = body_part
+        return first_line, headers, body
+
+    def run(self):
+        self.ws = websocket.WebSocket()
+        self.ws.connect(f'ws://{ROON_HOST}:{ROON_PORT}/api', timeout=10)
+        print(f"{ts()} [roon] connected to Roon Core", flush=True)
+
+        self.send_request("com.roonlabs.registry:1/info")
+        resp = self.ws.recv()
+        first, headers, body = self.parse_response(resp)
+        print(f"{ts()} [roon] core: {body.get('display_name', '?')} v{body.get('display_version', '?')}", flush=True)
+
+        token = None
+        if os.path.exists(TOKEN_FILE):
+            with open(TOKEN_FILE) as f:
+                token = json.load(f).get("token")
+
+        reg_info = {
+            "extension_id": "com.roonaa6.metadata",
+            "display_name": "RooNAA6 Metadata",
+            "display_version": "1.0.0",
+            "publisher": "RooNAA6",
+            "email": "noreply@example.com",
+            "provided_services": [],
+            "required_services": ["com.roonlabs.transport:2"],
+            "optional_services": [],
+            "website": ""
+        }
+        if token:
+            reg_info["token"] = token
+
+        self.send_request("com.roonlabs.registry:1/register", reg_info)
+        print(f"{ts()} [roon] registration sent", flush=True)
+
+        self.ws.settimeout(60)
+        while True:
+            try:
+                resp = self.ws.recv()
+                first, headers, body = self.parse_response(resp)
+                if first is None:
+                    continue
+                if body and isinstance(body, dict):
+                    if "token" in body:
+                        with open(TOKEN_FILE, "w") as f:
+                            json.dump({"token": body["token"]}, f)
+                        print(f"{ts()} [roon] paired!", flush=True)
+                        self.send_request("com.roonlabs.transport:2/subscribe_zones",
+                                        {"subscription_key": "zones"})
+                    zones = body.get("zones") or body.get("zones_changed") or []
+                    if zones:
+                        for zone in zones:
+                            np = zone.get("now_playing")
+                            if np:
+                                self._save_metadata(zone, np)
+            except websocket.WebSocketTimeoutException:
+                continue
+            except Exception as e:
+                print(f"{ts()} [roon] error: {e}", flush=True)
+                break
+
+    def _save_metadata(self, zone, now_playing):
+        zone_name = zone.get("display_name", "unknown")
+        if zone_name != "Einstein":
+            return
+        three = now_playing.get("three_line", {})
+        two = now_playing.get("two_line", {})
+        one = now_playing.get("one_line", {})
+        title = three.get("line1") or two.get("line1") or one.get("line1", "")
+        artist = three.get("line2") or two.get("line2") or ""
+        album = three.get("line3") or ""
+        image_key = now_playing.get("image_key", "")
+
+        metadata = {
+            "title": title, "artist": artist, "album": album,
+            "zone": zone_name, "image_key": image_key
+        }
+
+        if image_key and image_key != self._last_image_key:
+            self._last_image_key = image_key
+            self._download_cover(image_key)
+
+        with open(METADATA_FILE, "w") as f:
+            json.dump(metadata, f)
+
+        print(f"{ts()} [roon] {artist} — {title} ({album})", flush=True)
+
+    def _download_cover(self, image_key):
+        url = f'http://{ROON_HOST}:{ROON_PORT}/api/image/{image_key}?scale=fit&width=400&height=400&format=image/jpeg'
+        try:
+            resp = urllib.request.urlopen(url, timeout=5)
+            data = resp.read()
+            with open('/tmp/roon_cover.jpg', 'wb') as f:
+                f.write(data)
+            print(f"{ts()} [roon] cover art: {len(data)}b", flush=True)
+        except Exception as e:
+            print(f"{ts()} [roon] cover download failed: {e}", flush=True)
+
+
+def roon_listener_thread():
+    """Roon metadata listener with auto-reconnect. Runs as daemon thread."""
+    while True:
+        try:
+            rm = RoonMetadata()
+            rm.run()
+        except Exception as e:
+            print(f"{ts()} [roon] connection error: {e}", flush=True)
+        print(f"{ts()} [roon] reconnecting in 5s...", flush=True)
+        time.sleep(5)
+
 if __name__ == '__main__':
     threading.Thread(target=discovery_responder, daemon=True).start()
 
