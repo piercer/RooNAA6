@@ -1,6 +1,8 @@
 use std::net::{Ipv4Addr, UdpSocket};
 
-use crate::{ts, NAA_PORT};
+use crate::ts;
+
+const NAA_PORT: u16 = 43210;
 
 const MCAST_ADDRS: [Ipv4Addr; 2] = [
     Ipv4Addr::new(224, 0, 0, 199),

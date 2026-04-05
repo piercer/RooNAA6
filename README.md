@@ -27,21 +27,20 @@ The proxy also handles NAA multicast discovery (224.0.0.199, 239.192.0.199) so H
 
 ## Configuration
 
-Edit the constants in `src/main.rs`:
+Copy `config.toml.example` to `config.toml` and edit:
 
-| Constant | Description | Example |
-|----------|-------------|---------|
-| `NAA_HOST` | IP of the real NAA endpoint (e.g. T8) | `192.168.30.109` |
-| `NAA_PORT` | NAA port (always 43210) | `43210` |
-| `MCAST_IFACE` | Interface IP for multicast discovery | `192.168.30.212` |
+```toml
+[naa]
+host = "192.168.30.109"         # IP of the real NAA endpoint (e.g. T8)
+# port = 43210                  # NAA port (default: 43210)
+mcast_iface = "192.168.30.212"  # Interface IP for multicast discovery
 
-Edit the constants in `src/roon.rs`:
-
-| Constant | Description | Example |
-|----------|-------------|---------|
-| `ROON_HOST` | IP of the Roon Core | `192.168.30.23` |
-| `ROON_PORT` | Roon Core HTTP/WebSocket port | `9330` |
-| `ZONE_NAME` | Roon zone name to monitor | `Einstein` |
+[roon]
+host = "192.168.30.23"          # IP of the Roon Core
+# port = 9330                   # Roon HTTP/WebSocket port (default: 9330)
+zone = "Einstein"               # Roon zone name to monitor
+# token_file = "/tmp/roon_token.json"  # Auth token persistence (default)
+```
 
 ## Build and deploy
 
@@ -49,11 +48,12 @@ Edit the constants in `src/roon.rs`:
 # Build
 cargo build --release
 
-# Copy to the proxy host
-scp target/release/RooNAA6 user@proxy-host:/usr/local/bin/
+# Copy binary and config to the proxy host
+scp target/release/RooNAA6 config.toml user@proxy-host:/usr/local/bin/
 
-# Run (logs to stderr)
+# Run (reads config.toml from current directory, or pass a path)
 RooNAA6
+RooNAA6 /etc/roonaa6/config.toml
 ```
 
 ## First run — Roon pairing

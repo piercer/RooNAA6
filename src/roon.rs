@@ -7,14 +7,9 @@ use tungstenite::{Message, WebSocket};
 use crate::metadata::{Metadata, SharedMetadata};
 use crate::ts;
 
-const ROON_HOST: &str = "192.168.30.23";
-const ROON_PORT: u16 = 9330;
-const ZONE_NAME: &str = "Einstein";
-const TOKEN_FILE: &str = "/tmp/roon_token.json";
-
-pub fn run(shared: SharedMetadata) {
+pub fn run(shared: SharedMetadata, roon_host: &str, roon_port: u16, zone_name: &str, token_file: &str) {
     loop {
-        match run_once(&shared) {
+        match run_once(&shared, roon_host, roon_port, zone_name, token_file) {
             Ok(()) => {}
             Err(e) => eprintln!("{} [roon] connection error: {}", ts(), e),
         }
@@ -23,9 +18,9 @@ pub fn run(shared: SharedMetadata) {
     }
 }
 
-fn run_once(shared: &SharedMetadata) -> Result<(), Box<dyn std::error::Error>> {
-    let url = format!("ws://{}:{}/api", ROON_HOST, ROON_PORT);
-    let tcp = TcpStream::connect((ROON_HOST, ROON_PORT))?;
+fn run_once(shared: &SharedMetadata, roon_host: &str, roon_port: u16, zone_name: &str, token_file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!("ws://{}:{}/api", roon_host, roon_port);
+    let tcp = TcpStream::connect((roon_host, roon_port))?;
     tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
     let (mut ws, _) = tungstenite::client::client_with_config(
         &url,
@@ -53,7 +48,7 @@ fn run_once(shared: &SharedMetadata) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{} [roon] core: {} v{}", ts(), display, version);
 
     // Register extension
-    let token = load_token();
+    let token = load_token(token_file);
     let mut reg = serde_json::json!({
         "extension_id": "com.roonaa6.metadata",
         "display_name": "RooNAA6 Metadata",
@@ -116,7 +111,7 @@ fn run_once(shared: &SharedMetadata) -> Result<(), Box<dyn std::error::Error>> {
 
         // Handle token (pairing response)
         if let Some(t) = body.get("token").and_then(|v| v.as_str()) {
-            save_token(t);
+            save_token(token_file, t);
             eprintln!("{} [roon] paired!", ts());
             send_request(
                 &mut ws,
@@ -135,11 +130,11 @@ fn run_once(shared: &SharedMetadata) -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(zones) = zones {
             for zone in zones {
-                let zone_name = zone
+                let zn = zone
                     .get("display_name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                if zone_name != ZONE_NAME {
+                if zn != zone_name {
                     continue;
                 }
                 if let Some(np) = zone.get("now_playing") {
@@ -175,7 +170,7 @@ fn run_once(shared: &SharedMetadata) -> Result<(), Box<dyn std::error::Error>> {
                     let mut cover_art = shared.get_cover_art();
                     if !image_key.is_empty() && image_key != last_image_key {
                         last_image_key = image_key.clone();
-                        cover_art = download_cover(&image_key);
+                        cover_art = download_cover(roon_host, roon_port, &image_key);
                     }
 
                     eprintln!(
@@ -298,23 +293,23 @@ fn parse_moo_response(data: &[u8]) -> (String, std::collections::HashMap<String,
     (first_line, headers, body)
 }
 
-fn load_token() -> Option<String> {
-    let data = std::fs::read_to_string(TOKEN_FILE).ok()?;
+fn load_token(token_file: &str) -> Option<String> {
+    let data = std::fs::read_to_string(token_file).ok()?;
     let v: Value = serde_json::from_str(&data).ok()?;
     v.get("token").and_then(|t| t.as_str()).map(|s| s.to_string())
 }
 
-fn save_token(token: &str) {
+fn save_token(token_file: &str, token: &str) {
     let v = serde_json::json!({"token": token});
-    if let Err(e) = std::fs::write(TOKEN_FILE, serde_json::to_string(&v).unwrap()) {
+    if let Err(e) = std::fs::write(token_file, serde_json::to_string(&v).unwrap()) {
         eprintln!("{} [roon] failed to save token: {}", ts(), e);
     }
 }
 
-fn download_cover(image_key: &str) -> Option<Vec<u8>> {
+fn download_cover(roon_host: &str, roon_port: u16, image_key: &str) -> Option<Vec<u8>> {
     let url = format!(
         "http://{}:{}/api/image/{}?scale=fit&width=250&height=250&format=image/jpeg",
-        ROON_HOST, ROON_PORT, image_key
+        roon_host, roon_port, image_key
     );
     let agent = ureq::Agent::new_with_config(
         ureq::config::Config::builder()

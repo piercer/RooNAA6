@@ -1,18 +1,11 @@
+mod config;
 mod metadata;
 mod discovery;
 mod frame;
 mod proxy;
 mod roon;
 
-use std::net::Ipv4Addr;
-use std::thread;
 use std::time::SystemTime;
-
-pub const NAA_HOST: &str = "192.168.30.109";
-pub const NAA_PORT: u16 = 43210;
-pub const BIND_ADDR: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
-// For multicast, set this to the interface IP where HQPlayer discovers NAA devices
-pub const MCAST_IFACE: Ipv4Addr = Ipv4Addr::new(192, 168, 30, 212);
 
 pub fn ts() -> String {
     let now = SystemTime::now()
@@ -30,28 +23,38 @@ pub fn ts() -> String {
 }
 
 fn main() {
+    let cfg = config::load();
+
     eprintln!("{} RooNAA6 starting", ts());
 
-    thread::Builder::new()
+    let mcast_iface = cfg.naa.mcast_iface;
+    std::thread::Builder::new()
         .name("discovery".into())
-        .spawn(move || discovery::run(MCAST_IFACE))
+        .spawn(move || discovery::run(mcast_iface))
         .unwrap();
 
     let shared = metadata::SharedMetadata::new();
 
+    let roon_host = cfg.roon.host.clone();
+    let roon_port = cfg.roon.port;
+    let zone_name = cfg.roon.zone.clone();
+    let token_file = cfg.roon.token_file.clone();
     let shared_roon = shared.clone();
-    thread::Builder::new()
+    std::thread::Builder::new()
         .name("roon".into())
-        .spawn(move || roon::run(shared_roon))
+        .spawn(move || roon::run(shared_roon, &roon_host, roon_port, &zone_name, &token_file))
         .unwrap();
 
-    let listener = std::net::TcpListener::bind(("0.0.0.0", NAA_PORT)).unwrap();
+    let naa_host = cfg.naa.host;
+    let naa_port = cfg.naa.port;
+
+    let listener = std::net::TcpListener::bind(("0.0.0.0", naa_port)).unwrap();
     eprintln!(
         "{} NAA proxy: :{} -> {}:{}",
         ts(),
-        NAA_PORT,
-        NAA_HOST,
-        NAA_PORT
+        naa_port,
+        naa_host,
+        naa_port
     );
 
     for stream in listener.incoming() {
@@ -65,7 +68,7 @@ fn main() {
         let addr = client.peer_addr().unwrap();
         eprintln!("{} HQP connected from {}", ts(), addr);
 
-        let naa = match std::net::TcpStream::connect((NAA_HOST, NAA_PORT)) {
+        let naa = match std::net::TcpStream::connect((&*naa_host, naa_port)) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("{} NAA connect failed: {}", ts(), e);
@@ -79,18 +82,17 @@ fn main() {
         let naa_w = naa.try_clone().unwrap();
         let shared_clone = shared.clone();
 
-        let t1 = thread::Builder::new()
+        let t1 = std::thread::Builder::new()
             .name("hqp-to-naa".into())
             .spawn(move || proxy::forward_hqp_to_naa(client_r, naa_w, shared_clone))
             .unwrap();
 
-        let t2 = thread::Builder::new()
+        let t2 = std::thread::Builder::new()
             .name("naa-to-hqp".into())
             .spawn(move || proxy::forward_passthrough(naa_r, client_w, "NAA->HQP"))
             .unwrap();
 
         t1.join().unwrap();
-        // HQP disconnected — shut down both sockets so naa-to-hqp unblocks
         let _ = client.shutdown(std::net::Shutdown::Both);
         let _ = naa.shutdown(std::net::Shutdown::Both);
         t2.join().unwrap();
