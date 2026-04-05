@@ -3,6 +3,8 @@ name = "RooNAA6"
 version = "0.1.0"
 edition = "2021"
 description = "NAA v6 metadata-injecting proxy for HQPlayer → NAA endpoint"
+license = "MIT"
+authors = ["Conrad"]
 
 [[bin]]
 name = "RooNAA6"
@@ -14,3 +16,13 @@ serde_json = "1"
 toml = "0.8"
 ureq = "3"
 tungstenite = "0.26"
+
+[package.metadata.deb]
+maintainer = "Conrad"
+section = "sound"
+conf-files = ["/etc/roonaa6/config.toml"]
+assets = [
+    ["target/release/RooNAA6", "usr/bin/", "755"],
+    ["config.toml.example", "etc/roonaa6/config.toml", "644"],
+    ["debian/roonaa6.service", "lib/systemd/system/roonaa6.service", "644"],
+]
