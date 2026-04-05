@@ -22,7 +22,14 @@ impl SharedMetadata {
     }
 
     pub fn get(&self) -> Metadata {
-        self.inner.lock().unwrap().clone()
+        let inner = self.inner.lock().unwrap();
+        Metadata {
+            title: inner.title.clone(),
+            artist: inner.artist.clone(),
+            album: inner.album.clone(),
+            image_key: inner.image_key.clone(),
+            cover_art: None, // use get_cover_art() for the expensive JPEG clone
+        }
     }
 
     pub fn set(&self, meta: Metadata) {

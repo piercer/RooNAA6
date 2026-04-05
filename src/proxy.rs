@@ -70,6 +70,8 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
     let mut injected_this_start = false;
     let mut last_injected_title: Option<String> = None;
     let mut frame_count: u64 = 0;
+    let mut strip_logged = false;
+    let mut out = Vec::with_capacity(65536 + 4096);
 
     loop {
         let n = match src.read(&mut buf) {
@@ -105,6 +107,7 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                         injected_this_start = false;
                         last_injected_title = None;
                         frame_count = 0;
+                        strip_logged = false;
                         header_buf.clear();
                         pass_remaining = 0;
                         skip_remaining = 0;
@@ -121,7 +124,7 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
 
         // Binary frame processing
         let mut pos = 0;
-        let mut out = Vec::with_capacity(data.len() + 4096);
+        out.clear();
 
         while pos < data.len() {
             match phase {
@@ -151,6 +154,7 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                             injected_this_start = false;
                             last_injected_title = None;
                             frame_count = 0;
+                            strip_logged = false;
                             header_buf.clear();
                             pass_remaining = 0;
                             skip_remaining = 0;
@@ -171,7 +175,7 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                     pos += take;
 
                     if header_buf.len() == FRAME_HEADER_SIZE {
-                        let mut header = parse_header(&header_buf).unwrap();
+                        let mut header = parse_header(&header_buf).expect("header_buf is FRAME_HEADER_SIZE");
                         header_buf.clear();
 
                         if is_corrupt(&header) {
@@ -279,11 +283,14 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                             pass_remaining = pcm_bytes + header.pos_len as usize;
                             skip_remaining = orig_meta_len + orig_pic_len;
 
-                            eprintln!(
-                                "{} [STRIP] META refresh stripped (frame {})",
-                                ts(),
-                                frame_count
-                            );
+                            if !strip_logged {
+                                eprintln!(
+                                    "{} [STRIP] META refresh stripped (frame {})",
+                                    ts(),
+                                    frame_count
+                                );
+                                strip_logged = true;
+                            }
                         } else if injected_this_start
                             && !title.is_empty()
                             && frame_count % 300 == 0
