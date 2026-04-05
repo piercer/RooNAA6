@@ -42,18 +42,44 @@ zone = "Einstein"               # Roon zone name to monitor
 # token_file = "/tmp/roon_token.json"  # Auth token persistence (default)
 ```
 
-## Build and deploy
+## Install from .deb package
+
+Download the `.deb` from the [releases page](https://github.com/piercer/RooNAA6/releases) and install:
 
 ```bash
-# Build
+sudo dpkg -i roonaa6_0.1.0-1_amd64.deb
+```
+
+This installs:
+- `/usr/bin/RooNAA6` — the proxy binary
+- `/etc/roonaa6/config.toml` — configuration (edit this)
+- `/lib/systemd/system/roonaa6.service` — systemd service
+
+Edit the config, then start:
+
+```bash
+sudo nano /etc/roonaa6/config.toml
+sudo systemctl enable --now roonaa6
+journalctl -u roonaa6 -f
+```
+
+The config file is preserved across package upgrades.
+
+## Build from source
+
+Requires a Rust toolchain.
+
+```bash
+# Build binary
 cargo build --release
 
-# Copy binary and config to the proxy host
-scp target/release/RooNAA6 config.toml user@proxy-host:/usr/local/bin/
+# Build .deb package (requires cargo-deb: cargo install cargo-deb)
+cargo deb
 
-# Run (reads config.toml from current directory, or pass a path)
-RooNAA6
-RooNAA6 /etc/roonaa6/config.toml
+# Or deploy manually
+scp target/release/RooNAA6 config.toml user@proxy-host:~
+ssh user@proxy-host './RooNAA6'                           # reads config.toml from cwd
+ssh user@proxy-host './RooNAA6 /path/to/config.toml'      # or specify a path
 ```
 
 ## First run — Roon pairing
@@ -62,34 +88,7 @@ On first launch, the proxy registers as a Roon extension called "RooNAA6 Metadat
 
 1. Open Roon → Settings → Extensions
 2. Find "RooNAA6 Metadata" and click Enable
-3. The proxy saves the auth token to `/tmp/roon_token.json` for subsequent runs
-
-## Running as a systemd service
-
-Create `/etc/systemd/system/roonaa6.service`:
-
-```ini
-[Unit]
-Description=RooNAA6 NAA metadata proxy
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/RooNAA6
-Restart=always
-RestartSec=5
-User=your-user
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now roonaa6
-journalctl -u roonaa6 -f
-```
+3. The proxy saves the auth token to `/tmp/roon_token.json` for subsequent runs (configurable via `token_file`)
 
 ## HQPlayer setup
 
