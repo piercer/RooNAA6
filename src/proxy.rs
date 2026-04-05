@@ -34,7 +34,7 @@ pub fn forward_passthrough(mut src: TcpStream, mut dst: TcpStream, label: &str) 
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Phase {
     Header,
     Pass,
@@ -359,5 +359,239 @@ pub fn log_xml(label: &str, data: &[u8]) {
     }
     if let Ok(text) = std::str::from_utf8(data) {
         eprintln!("{} [{}] {}", ts(), label, text.trim());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::{StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC};
+    use crate::metadata::{Metadata, SharedMetadata};
+    use std::sync::Arc;
+
+    fn pcm_params() -> StreamParams {
+        StreamParams {
+            bits: 32,
+            rate: 44100,
+            is_dsd: false,
+            bytes_per_sample: 4,
+        }
+    }
+
+    fn dsd_params() -> StreamParams {
+        StreamParams {
+            bits: 1,
+            rate: 2822400,
+            is_dsd: true,
+            bytes_per_sample: 1,
+        }
+    }
+
+    fn make_header(type_mask: u32, pcm_len: u32, pos_len: u32, meta_len: u32, pic_len: u32) -> FrameHeader {
+        FrameHeader {
+            raw: [0u8; FRAME_HEADER_SIZE],
+            type_mask,
+            pcm_len,
+            pos_len,
+            meta_len,
+            pic_len,
+        }
+    }
+
+    fn make_meta(title: &str, artist: &str, album: &str, cover: Option<&[u8]>) -> Metadata {
+        Metadata {
+            title: title.to_string(),
+            artist: artist.to_string(),
+            album: album.to_string(),
+            cover_art: cover.map(|c| Arc::new(c.to_vec())),
+        }
+    }
+
+    // --- new() defaults ---
+
+    #[test]
+    fn test_new_defaults() {
+        let shared = SharedMetadata::new();
+        let proc = FrameProcessor::new(shared);
+        assert_eq!(proc.phase, Phase::Header);
+        assert_eq!(proc.frame_count, 0);
+        assert!(!proc.injected);
+        assert!(proc.last_title.is_none());
+        assert!(proc.pending_inject.is_none());
+        assert_eq!(proc.pass_remaining, 0);
+        assert_eq!(proc.skip_remaining, 0);
+        assert!(!proc.strip_logged);
+        assert_eq!(proc.params.bits, 32);
+        assert!(!proc.params.is_dsd);
+    }
+
+    // --- reset_for_start() ---
+
+    #[test]
+    fn test_reset_clears_state() {
+        let shared = SharedMetadata::new();
+        let mut proc = FrameProcessor::new(shared);
+
+        // Dirty up the state
+        proc.injected = true;
+        proc.last_title = Some("Old Song".into());
+        proc.frame_count = 500;
+        proc.strip_logged = true;
+        proc.phase = Phase::Skip;
+        proc.pass_remaining = 1000;
+        proc.skip_remaining = 200;
+        proc.pending_inject = Some(vec![1, 2, 3]);
+        proc.header_buf.extend_from_slice(&[0u8; 16]);
+
+        proc.reset_for_start(dsd_params());
+
+        assert_eq!(proc.phase, Phase::Header);
+        assert!(!proc.injected);
+        assert!(proc.last_title.is_none());
+        assert_eq!(proc.frame_count, 0);
+        assert!(!proc.strip_logged);
+        assert!(proc.header_buf.is_empty());
+        assert_eq!(proc.pass_remaining, 0);
+        assert_eq!(proc.skip_remaining, 0);
+        assert!(proc.pending_inject.is_none());
+        assert!(proc.params.is_dsd);
+        assert_eq!(proc.params.bits, 1);
+    }
+
+    // --- inject() ---
+
+    #[test]
+    fn test_inject_with_cover() {
+        let shared = SharedMetadata::new();
+        let mut proc = FrameProcessor::new(shared);
+        proc.params = pcm_params();
+
+        let fake_jpeg = vec![0xFF, 0xD8, 0x00, 0x01];
+        let meta = make_meta("Title", "Artist", "Album", Some(&fake_jpeg));
+        let mut header = make_header(0x01, 100, 50, 0, 0);
+
+        let jpeg_len = proc.inject(&mut header, &meta, true);
+
+        assert_eq!(jpeg_len, 4);
+        assert!(header.type_mask & TYPE_META != 0);
+        assert!(header.type_mask & TYPE_PIC != 0);
+        assert!(header.meta_len > 0);
+        assert_eq!(header.pic_len, 4);
+        assert!(proc.pending_inject.is_some());
+        assert_eq!(proc.last_title.as_deref(), Some("Title"));
+
+        // Payload should contain meta section + JPEG
+        let payload = proc.pending_inject.unwrap();
+        assert!(payload.ends_with(&fake_jpeg));
+    }
+
+    #[test]
+    fn test_inject_without_cover() {
+        let shared = SharedMetadata::new();
+        let mut proc = FrameProcessor::new(shared);
+        proc.params = pcm_params();
+
+        let meta = make_meta("Title", "Artist", "Album", Some(&[0xFF, 0xD8]));
+        let mut header = make_header(0x01, 100, 50, 0, 0);
+
+        let jpeg_len = proc.inject(&mut header, &meta, false);
+
+        assert_eq!(jpeg_len, 0);
+        assert!(header.type_mask & TYPE_META != 0);
+        assert_eq!(header.type_mask & TYPE_PIC, 0);
+        assert_eq!(header.pic_len, 0);
+        assert!(proc.pending_inject.is_some());
+
+        // Payload should be meta section only, no JPEG
+        let payload = proc.pending_inject.unwrap();
+        assert!(!payload.windows(2).any(|w| w == [0xFF, 0xD8]));
+    }
+
+    #[test]
+    fn test_inject_no_cover_art_available() {
+        let shared = SharedMetadata::new();
+        let mut proc = FrameProcessor::new(shared);
+        proc.params = pcm_params();
+
+        let meta = make_meta("Title", "Artist", "Album", None);
+        let mut header = make_header(0x01, 100, 50, 0, 0);
+
+        let jpeg_len = proc.inject(&mut header, &meta, true);
+
+        assert_eq!(jpeg_len, 0);
+        assert!(header.type_mask & TYPE_META != 0);
+        assert_eq!(header.type_mask & TYPE_PIC, 0);
+        assert_eq!(header.pic_len, 0);
+    }
+
+    #[test]
+    fn test_inject_meta_section_content() {
+        let shared = SharedMetadata::new();
+        let mut proc = FrameProcessor::new(shared);
+        proc.params = pcm_params();
+
+        let meta = make_meta("My Song", "My Artist", "My Album", None);
+        let mut header = make_header(0x09, 100, 50, 200, 0);
+
+        proc.inject(&mut header, &meta, false);
+
+        let payload = proc.pending_inject.unwrap();
+        let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
+        assert!(text.starts_with("[metadata]\n"));
+        assert!(text.contains("song=My Song\n"));
+        assert!(text.contains("artist=My Artist\n"));
+        assert!(text.contains("album=My Album\n"));
+        assert!(text.contains("samplerate=44100\n"));
+        assert!(text.contains("sdm=0\n"));
+    }
+
+    #[test]
+    fn test_inject_dsd_uses_base_rate() {
+        let shared = SharedMetadata::new();
+        let mut proc = FrameProcessor::new(shared);
+        proc.params = dsd_params();
+
+        let meta = make_meta("DSD Track", "Artist", "Album", None);
+        let mut header = make_header(0x09, 100, 50, 200, 0);
+
+        proc.inject(&mut header, &meta, false);
+
+        let payload = proc.pending_inject.unwrap();
+        let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
+        assert!(text.contains("samplerate=2822400\n"));
+        assert!(text.contains("sdm=1\n"));
+        assert!(text.contains("bits=1\n"));
+    }
+
+    // --- strip() ---
+
+    #[test]
+    fn test_strip_clears_meta_and_pic() {
+        let shared = SharedMetadata::new();
+        let mut proc = FrameProcessor::new(shared);
+        proc.pending_inject = Some(vec![1, 2, 3]);
+
+        let mut header = make_header(0x0D, 100, 50, 300, 5000);
+
+        proc.strip(&mut header);
+
+        assert_eq!(header.type_mask & TYPE_META, 0);
+        assert_eq!(header.type_mask & TYPE_PIC, 0);
+        assert_eq!(header.meta_len, 0);
+        assert_eq!(header.pic_len, 0);
+        assert!(proc.pending_inject.is_none());
+    }
+
+    #[test]
+    fn test_strip_preserves_other_type_bits() {
+        let shared = SharedMetadata::new();
+        let mut proc = FrameProcessor::new(shared);
+
+        let mut header = make_header(0x1D, 100, 50, 300, 5000);
+        proc.strip(&mut header);
+
+        // 0x1D = PCM(0x01) | PIC(0x04) | META(0x08) | POS(0x10)
+        // After strip: PCM(0x01) | POS(0x10) = 0x11
+        assert_eq!(header.type_mask, 0x11);
     }
 }
