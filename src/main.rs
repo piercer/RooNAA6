@@ -2,6 +2,7 @@ mod metadata;
 mod discovery;
 mod frame;
 mod proxy;
+mod roon;
 
 use std::net::Ipv4Addr;
 use std::thread;
@@ -38,13 +39,11 @@ fn main() {
 
     let shared = metadata::SharedMetadata::new();
 
-    // Hardcoded test metadata for Stage 1
-    shared.set(metadata::Metadata {
-        title: "Test Title".into(),
-        artist: "Test Artist".into(),
-        album: "Test Album".into(),
-        ..Default::default()
-    });
+    let shared_roon = shared.clone();
+    thread::Builder::new()
+        .name("roon".into())
+        .spawn(move || roon::run(shared_roon))
+        .unwrap();
 
     let listener = std::net::TcpListener::bind(("0.0.0.0", NAA_PORT)).unwrap();
     eprintln!(
