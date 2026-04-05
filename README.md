@@ -121,6 +121,10 @@ Known mitigations:
 
 The issue appears to be triggered by rapid proxy restarts or repeated connect/disconnect cycles.
 
+### Playhead / progress bar
+
+The DAC does not display a playhead or track progress. The NAA v6 protocol carries a position field in each frame, but the proxy does not currently interpret or inject position data. This is a known limitation.
+
 ### DSD output mode
 
 HQPlayer's DSD output mode must be configured in HQPlayer settings. The proxy does not affect format negotiation — it passes all XML control messages through unchanged.
