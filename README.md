@@ -2,6 +2,18 @@
 
 Transparent TCP proxy that sits between HQPlayer and an NAA v6 endpoint (e.g. Eversolo T8 DAC), injecting Roon track metadata and cover art into the audio stream so the DAC displays what's playing.
 
+## Why this exists
+
+When using Roon with HQPlayer as an audio output, the signal chain is:
+
+```
+Roon Core → HQPlayer → NAA endpoint (DAC)
+```
+
+HQPlayer communicates with NAA endpoints using the NAA v6 protocol, which supports rich metadata (track title, artist, album, cover art). However, Roon only sends audio to HQPlayer — it doesn't pass track metadata through HQPlayer's pipeline. The result: your DAC displays nothing useful (typically just "Roon" or silence) even though Roon knows exactly what's playing.
+
+RooNAA6 solves this by sitting between HQPlayer and the NAA endpoint, independently fetching metadata from Roon Core via its WebSocket API, and injecting it into the NAA v6 audio stream so the DAC displays full track information.
+
 ## How it works
 
 ```
