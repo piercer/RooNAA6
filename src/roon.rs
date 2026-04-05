@@ -45,6 +45,9 @@ fn run_once(shared: &SharedMetadata) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(id) = body.get("core_id").and_then(|v| v.as_str()) {
         core_id = id.to_string();
     }
+    if core_id.is_empty() {
+        eprintln!("{} [roon] warning: no core_id in info response", ts());
+    }
     let display = body.get("display_name").and_then(|v| v.as_str()).unwrap_or("?");
     let version = body.get("display_version").and_then(|v| v.as_str()).unwrap_or("?");
     eprintln!("{} [roon] core: {} v{}", ts(), display, version);
@@ -81,6 +84,9 @@ fn run_once(shared: &SharedMetadata) -> Result<(), Box<dyn std::error::Error>> {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    eprintln!("{} [roon] read timeout, still connected", ts());
+                }
                 continue;
             }
             Err(e) => return Err(e.into()),
@@ -198,11 +204,11 @@ fn send_request(
     reqid: &mut u64,
     name: &str,
     body: Option<Value>,
-) -> Result<(), tungstenite::Error> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let rid = *reqid;
     *reqid += 1;
     let msg = if let Some(b) = body {
-        let content = serde_json::to_vec(&b).unwrap();
+        let content = serde_json::to_vec(&b)?;
         format!(
             "MOO/1 REQUEST {}\nRequest-Id: {}\nContent-Length: {}\nContent-Type: application/json\n\n",
             name, rid, content.len()
@@ -250,8 +256,8 @@ fn send_continue_response(
     ws: &mut WebSocket<TcpStream>,
     request_id: &str,
     body: &Value,
-) -> Result<(), tungstenite::Error> {
-    let content = serde_json::to_vec(body).unwrap();
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = serde_json::to_vec(body)?;
     let msg = format!(
         "MOO/1 CONTINUE Changed\nRequest-Id: {}\nContent-Length: {}\nContent-Type: application/json\n\n",
         request_id,
@@ -310,7 +316,12 @@ fn download_cover(image_key: &str) -> Option<Vec<u8>> {
         "http://{}:{}/api/image/{}?scale=fit&width=250&height=250&format=image/jpeg",
         ROON_HOST, ROON_PORT, image_key
     );
-    match ureq::get(&url).call() {
+    let agent = ureq::Agent::new_with_config(
+        ureq::config::Config::builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build(),
+    );
+    match agent.get(&url).call() {
         Ok(resp) => {
             match resp.into_body().read_to_vec() {
                 Ok(data) if data.len() > 100 && data[0] == 0xFF && data[1] == 0xD8 => {
