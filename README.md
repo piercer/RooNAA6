@@ -1,166 +1,126 @@
-# roon-naa6-bridge
+# RooNAA6
 
-Bridges Roon audio output to HQPlayer via the NAA 6 protocol.
+Transparent TCP proxy that sits between HQPlayer and an NAA v6 endpoint (e.g. Eversolo T8 DAC), injecting Roon track metadata and cover art into the audio stream so the DAC displays what's playing.
 
-Two systemd services work together:
+## How it works
 
-- **naa6-audio-bridge** (Rust) — reads PCM/DSD frames from an ALSA loopback device and streams them to HQPlayer over TCP using the NAA 6 protocol.
-- **roon-metadata-extension** (Node.js) — connects to Roon Core as an extension and forwards track metadata (title, artist, album, cover art) to HQPlayer via NAA 6 metadata messages.
-
----
-
-## Requirements
-
-- Ubuntu 24.04 LTS
-- Roon Bridge installed and running
-- HQPlayer running and reachable on the network
-- Node.js 24 LTS
-- Rust toolchain (for building from source)
-
----
-
-## 1. ALSA Loopback Setup
-
-The bridge uses the `snd-aloop` kernel module to create a virtual loopback sound card.
-
-**Load the module at boot:**
-
-```bash
-sudo cp alsa-loopback/etc/modules-load.d/snd-aloop.conf /etc/modules-load.d/
-sudo cp alsa-loopback/etc/modprobe.d/snd-aloop.conf     /etc/modprobe.d/
+```
+Roon Core ──> HQPlayer ──> RooNAA6 proxy ──> NAA endpoint (T8)
+                              │
+                              └── Roon Core WebSocket (metadata)
 ```
 
-**Load it immediately (without rebooting):**
+- HQPlayer connects to the proxy (thinking it's the NAA endpoint)
+- Proxy forwards all traffic bidirectionally to the real NAA endpoint
+- Proxy connects to Roon Core via WebSocket to get track metadata (title, artist, album, cover art)
+- On the first audio frame after playback starts, proxy injects metadata + cover art into the NAA v6 binary stream
+- Subsequent metadata from HQPlayer is stripped to keep the Roon metadata visible
+- Periodic refresh every ~30s prevents the DAC from reverting
+
+Handles PCM (up to 768kHz) and DSD (up to DSD512). Gapless track changes are detected via Roon zone subscription and metadata is re-injected at track boundaries.
+
+## Network requirements
+
+The proxy and HQPlayer must run on **different machines** because the NAA control port (43210) is fixed and cannot be changed. The proxy listens on 43210 and forwards to HQPlayer's NAA endpoint on another IP.
+
+The proxy also handles NAA multicast discovery (224.0.0.199, 239.192.0.199) so HQPlayer sees it in the device dropdown.
+
+## Configuration
+
+Edit the constants in `src/main.rs`:
+
+| Constant | Description | Example |
+|----------|-------------|---------|
+| `NAA_HOST` | IP of the real NAA endpoint (e.g. T8) | `192.168.30.109` |
+| `NAA_PORT` | NAA port (always 43210) | `43210` |
+| `MCAST_IFACE` | Interface IP for multicast discovery | `192.168.30.212` |
+
+Edit the constants in `src/roon.rs`:
+
+| Constant | Description | Example |
+|----------|-------------|---------|
+| `ROON_HOST` | IP of the Roon Core | `192.168.30.23` |
+| `ROON_PORT` | Roon Core HTTP/WebSocket port | `9330` |
+| `ZONE_NAME` | Roon zone name to monitor | `Einstein` |
+
+## Build and deploy
 
 ```bash
-sudo modprobe snd-aloop enable=1 index=2
-```
-
-**Verify it loaded:**
-
-```bash
-aplay -l | grep Loopback
-```
-
-You should see two loopback devices: `hw:2,0` (playback) and `hw:2,1` (capture).
-
----
-
-## 2. Configure Roon Bridge Output
-
-In Roon → Settings → Audio, enable the ALSA device that corresponds to the loopback playback side:
-
-- Device: `snd_aloop` / `Loopback, Loopback PCM` (card 2, device 0)
-- Set it as the output zone you want to bridge to HQPlayer.
-
-The bridge captures from `hw:Loopback,1,0` (the capture side of the loopback pair) by default.
-
----
-
-## 3. Build
-
-**naa6-audio-bridge (Rust):**
-
-```bash
-cd audio-bridge
+# Build
 cargo build --release
-sudo cp target/release/naa6-audio-bridge /usr/local/bin/
+
+# Copy to the proxy host
+scp target/release/RooNAA6 user@proxy-host:/usr/local/bin/
+
+# Run (logs to stderr)
+RooNAA6
 ```
 
-**roon-metadata-extension (Node.js):**
+## First run — Roon pairing
 
-```bash
-cd metadata-extension
-npm install --omit=dev
-npm run build
-sudo mkdir -p /usr/local/lib/roon-metadata-extension
-sudo cp -r dist package.json node_modules /usr/local/lib/roon-metadata-extension/
+On first launch, the proxy registers as a Roon extension called "RooNAA6 Metadata". You need to authorise it in Roon:
+
+1. Open Roon → Settings → Extensions
+2. Find "RooNAA6 Metadata" and click Enable
+3. The proxy saves the auth token to `/tmp/roon_token.json` for subsequent runs
+
+## Running as a systemd service
+
+Create `/etc/systemd/system/roonaa6.service`:
+
+```ini
+[Unit]
+Description=RooNAA6 NAA metadata proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/RooNAA6
+Restart=always
+RestartSec=5
+User=your-user
+
+[Install]
+WantedBy=multi-user.target
 ```
 
----
-
-## 4. Configuration
-
-Copy the example config and edit it:
-
 ```bash
-sudo mkdir -p /etc/roon-naa6-bridge
-sudo cp config.json.example /etc/roon-naa6-bridge/config.json
-sudo nano /etc/roon-naa6-bridge/config.json
-```
-
-### Config Reference
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `outputName` | `"HQPlayer via NAA6"` | Roon Output display name |
-| `alsaDevice` | `"hw:Loopback,1,0"` | ALSA capture device (loopback capture side) |
-| `hqplayerHost` | `"127.0.0.1"` | HQPlayer hostname or IP address |
-| `hqplayerPort` | `10700` | HQPlayer NAA 6 TCP port |
-| `reconnectBackoff` | `5000` | Reconnect delay in milliseconds |
-| `logLevel` | `"info"` | Log verbosity: `"info"` or `"debug"` |
-| `ipcSocket` | `"/run/roon-naa6-bridge/meta.sock"` | Unix socket path for metadata IPC |
-
----
-
-## 5. Service Installation
-
-**Create a dedicated service user:**
-
-```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups audio roon-bridge
-```
-
-**Install and enable the services:**
-
-```bash
-sudo cp naa6-audio-bridge.service        /etc/systemd/system/
-sudo cp roon-metadata-extension.service  /etc/systemd/system/
-
 sudo systemctl daemon-reload
-sudo systemctl enable --now naa6-audio-bridge
-sudo systemctl enable --now roon-metadata-extension
+sudo systemctl enable --now roonaa6
+journalctl -u roonaa6 -f
 ```
 
-**Check status:**
+## HQPlayer setup
 
-```bash
-sudo systemctl status naa6-audio-bridge
-sudo systemctl status roon-metadata-extension
-```
+1. In HQPlayer, select the proxy from the NAA device dropdown (shows as "RooNAA6 Proxy")
+2. Point Roon at HQPlayer as normal
+3. Play music — metadata and cover art should appear on the DAC
 
-**View logs:**
+## Known issues
 
-```bash
-journalctl -u naa6-audio-bridge -f
-journalctl -u roon-metadata-extension -f
-```
+### T8 metadata revert
 
----
+The Eversolo T8 sometimes enters a state where injected metadata appears briefly then reverts to showing "Roon". This is a T8 firmware issue, not a proxy bug — it affects the Python prototype identically.
 
-## 6. Updating Node.js Path
+Known mitigations:
+- Stop playback, wait a few seconds, play again
+- Power cycle the T8 (full power off, not just reboot)
+- Leave the T8 idle for a while
 
-If Node.js is installed via nvm rather than system packages, update the `ExecStart` path in `roon-metadata-extension.service`:
+The issue appears to be triggered by rapid proxy restarts or repeated connect/disconnect cycles.
 
-```bash
-which node   # e.g. /home/youruser/.nvm/versions/node/v24.14.1/bin/node
-```
+### DSD output mode
 
-Then edit the service file accordingly and run `sudo systemctl daemon-reload`.
+HQPlayer's DSD output mode must be configured in HQPlayer settings. The proxy does not affect format negotiation — it passes all XML control messages through unchanged.
 
----
+## Architecture
 
-## Troubleshooting
-
-**No audio forwarded:**
-- Check `aplay -l` to confirm the loopback device exists.
-- Confirm Roon Bridge is outputting to the loopback playback device.
-- Check `journalctl -u naa6-audio-bridge` for ALSA or connection errors.
-
-**Metadata not appearing in HQPlayer:**
-- Check `journalctl -u roon-metadata-extension` for Roon pairing errors.
-- Ensure the Roon Core has authorised the extension (check Roon → Settings → Extensions).
-
-**HQPlayer connection refused:**
-- Verify `hqplayerHost` and `hqplayerPort` in the config match HQPlayer's NAA settings.
-- Confirm HQPlayer is running and NAA is enabled.
+| File | Purpose |
+|------|---------|
+| `src/main.rs` | Entry point, TCP listener, thread spawning |
+| `src/proxy.rs` | Frame-level state machine (INJECT/STRIP/REFRESH/GAPLESS/PASSTHROUGH) |
+| `src/frame.rs` | NAA v6 header parsing, metadata section builder |
+| `src/discovery.rs` | UDP multicast discovery responder |
+| `src/roon.rs` | Roon Core WebSocket client (MOO/1 protocol) |
+| `src/metadata.rs` | Thread-safe shared metadata store |
