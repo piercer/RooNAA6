@@ -111,11 +111,30 @@ def forward_hqp_to_t8(src, dst):
                     pending_inject = None
                     injected_this_start = False
                     last_injected_title = None
+                    frame_count = 0
                     header_buf = b''
-                    m = re.search(rb'bits="(\d+)"', data)
-                    if m:
-                        bytes_per_sample = int(m.group(1)) // 8
-                        print(f"{ts()} [HQP->T8] start: {bytes_per_sample} bytes/sample", flush=True)
+                    m_bits = re.search(rb'bits="(\d+)"', data)
+                    m_rate = re.search(rb'rate="(\d+)"', data)
+                    m_stream = re.search(rb'stream="(\w+)"', data)
+                    if m_bits:
+                        bits = int(m_bits.group(1))
+                        bytes_per_sample = max(1, bits // 8)
+                        rate = int(m_rate.group(1)) if m_rate else 44100
+                        stream = m_stream.group(1).decode() if m_stream else 'pcm'
+                        is_dsd = (stream == 'dsd')
+                        if is_dsd:
+                            # HQPlayer reports DSD64 base rate in metadata regardless of actual rate
+                            meta_rate = 2822400
+                        else:
+                            meta_rate = rate
+                        meta_template = (
+                            f'bitrate={meta_rate * bits * 2}\n'
+                            f'bits={bits}\nchannels=2\nfloat=0\n'
+                            f'samplerate={meta_rate}\n'
+                            f'sdm={1 if is_dsd else 0}\n'
+                            f'song=Roon\n'
+                        ).encode()
+                        print(f"{ts()} [HQP->T8] start: {bytes_per_sample} bytes/sample, {stream} {rate}Hz", flush=True)
                 dst.sendall(data)
                 continue
 
@@ -139,10 +158,27 @@ def forward_hqp_to_t8(src, dst):
                             injected_this_start = False
                             last_injected_title = None
                             frame_count = 0
-                            m = re.search(rb'bits="(\d+)"', xml_data)
-                            if m:
-                                bytes_per_sample = int(m.group(1)) // 8
-                                print(f"{ts()} [HQP->T8] start: {bytes_per_sample} bytes/sample", flush=True)
+                            m_bits = re.search(rb'bits="(\d+)"', xml_data)
+                            m_rate = re.search(rb'rate="(\d+)"', xml_data)
+                            m_stream = re.search(rb'stream="(\w+)"', xml_data)
+                            if m_bits:
+                                bits = int(m_bits.group(1))
+                                bytes_per_sample = max(1, bits // 8)
+                                rate = int(m_rate.group(1)) if m_rate else 44100
+                                stream = m_stream.group(1).decode() if m_stream else 'pcm'
+                                is_dsd = (stream == 'dsd')
+                                if is_dsd:
+                                    meta_rate = 2822400
+                                else:
+                                    meta_rate = rate
+                                meta_template = (
+                                    f'bitrate={meta_rate * bits * 2}\n'
+                                    f'bits={bits}\nchannels=2\nfloat=0\n'
+                                    f'samplerate={meta_rate}\n'
+                                    f'sdm={1 if is_dsd else 0}\n'
+                                    f'song=Roon\n'
+                                ).encode()
+                                print(f"{ts()} [HQP->T8] start: {bytes_per_sample} bytes/sample, {stream} {rate}Hz", flush=True)
                         dst.sendall(xml_data)
                         break
 
@@ -165,7 +201,7 @@ def forward_hqp_to_t8(src, dst):
                         title = meta.get("title", "")
                         frame_count += 1
 
-                        if pcm_len > 100000 or pos_len > 10000:
+                        if pcm_len > 1000000 or pos_len > 10000:
                             print(f"{ts()} [CORRUPT] header hex: {header.hex()}", flush=True)
 
                         if title and has_meta and not injected_this_start:
