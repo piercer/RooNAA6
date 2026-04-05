@@ -1,8 +1,0 @@
-{
-  "outputName": "HQPlayer via NAA6",
-  "alsaDevice": "hw:Loopback,1,0",
-  "listenPort": 43210,
-  "reconnectBackoff": 5000,
-  "logLevel": "info",
-  "ipcSocket": "/run/roon-naa6-bridge/meta.sock"
-}

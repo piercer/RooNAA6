@@ -85,19 +85,6 @@ pub fn build_meta_section(
     section
 }
 
-/// Build a meta_template from stream parameters (used as default metadata).
-/// This is what HQPlayer sends — format fields + `song=Roon`.
-pub fn build_meta_template(params: &StreamParams) -> Vec<u8> {
-    let meta_rate = if params.is_dsd { 2822400 } else { params.rate };
-    let bitrate = meta_rate as u64 * params.bits as u64 * 2;
-    let sdm = if params.is_dsd { 1 } else { 0 };
-    format!(
-        "bitrate={}\nbits={}\nchannels=2\nfloat=0\nsamplerate={}\nsdm={}\nsong=Roon\n",
-        bitrate, params.bits, meta_rate, sdm
-    )
-    .into_bytes()
-}
-
 /// Parse an XML start message for stream parameters.
 /// Extracts bits="N", rate="N", stream="pcm|dsd" from the XML text.
 /// Returns None if this isn't a start message or lacks required attributes.
