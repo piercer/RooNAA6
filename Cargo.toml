@@ -1,0 +1,12 @@
+[package]
+name = "RooNAA6"
+version = "0.1.0"
+edition = "2021"
+description = "NAA v6 metadata-injecting proxy for HQPlayer → NAA endpoint"
+
+[[bin]]
+name = "RooNAA6"
+path = "src/main.rs"
+
+[dependencies]
+socket2 = "0.5"
