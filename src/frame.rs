@@ -7,6 +7,7 @@ pub const TYPE_META: u32 = 0x08;
 pub const TYPE_POS: u32 = 0x10;
 
 pub struct FrameHeader {
+    pub raw: [u8; FRAME_HEADER_SIZE],
     pub type_mask: u32,
     pub pcm_len: u32,
     pub pos_len: u32,
@@ -32,11 +33,15 @@ pub struct StreamParams {
 }
 
 /// Parse a 32-byte frame header. Returns None if buffer is too short.
+/// Preserves the full 32-byte raw header for serialization.
 pub fn parse_header(buf: &[u8]) -> Option<FrameHeader> {
     if buf.len() < FRAME_HEADER_SIZE {
         return None;
     }
+    let mut raw = [0u8; FRAME_HEADER_SIZE];
+    raw.copy_from_slice(&buf[..FRAME_HEADER_SIZE]);
     Some(FrameHeader {
+        raw,
         type_mask: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
         pcm_len: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
         pos_len: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
@@ -45,9 +50,10 @@ pub fn parse_header(buf: &[u8]) -> Option<FrameHeader> {
     })
 }
 
-/// Serialize a FrameHeader back to 32 bytes (for modified headers).
+/// Serialize a FrameHeader back to 32 bytes.
+/// Writes modified fields back into the preserved raw header.
 pub fn serialize_header(h: &FrameHeader) -> [u8; FRAME_HEADER_SIZE] {
-    let mut buf = [0u8; FRAME_HEADER_SIZE];
+    let mut buf = h.raw;
     buf[0..4].copy_from_slice(&h.type_mask.to_le_bytes());
     buf[4..8].copy_from_slice(&h.pcm_len.to_le_bytes());
     buf[8..12].copy_from_slice(&h.pos_len.to_le_bytes());
@@ -164,6 +170,7 @@ mod tests {
     #[test]
     fn test_serialize_roundtrip() {
         let h = FrameHeader {
+            raw: [0u8; FRAME_HEADER_SIZE],
             type_mask: 0x1D,
             pcm_len: 81920,
             pos_len: 271,
@@ -263,6 +270,7 @@ mod tests {
     #[test]
     fn test_is_corrupt() {
         let h = FrameHeader {
+            raw: [0u8; FRAME_HEADER_SIZE],
             type_mask: 0x1D,
             pcm_len: 2_000_000,
             pos_len: 271,
@@ -272,6 +280,7 @@ mod tests {
         assert!(is_corrupt(&h));
 
         let h2 = FrameHeader {
+            raw: [0u8; FRAME_HEADER_SIZE],
             type_mask: 0x1D,
             pcm_len: 81920,
             pos_len: 20_000,
@@ -281,6 +290,7 @@ mod tests {
         assert!(is_corrupt(&h2));
 
         let h3 = FrameHeader {
+            raw: [0u8; FRAME_HEADER_SIZE],
             type_mask: 0x11,
             pcm_len: 602112,
             pos_len: 271,
