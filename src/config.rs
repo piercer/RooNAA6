@@ -35,7 +35,7 @@ fn default_roon_port() -> u16 {
 }
 
 fn default_token_file() -> String {
-    "/tmp/roon_token.json".to_string()
+    "/etc/roonaa6/roon_token.json".to_string()
 }
 
 pub fn load() -> Config {

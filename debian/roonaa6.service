@@ -8,8 +8,6 @@ Type=simple
 ExecStart=/usr/bin/RooNAA6 /etc/roonaa6/config.toml
 Restart=always
 RestartSec=5
-DynamicUser=yes
-StateDirectory=roonaa6
 
 [Install]
 WantedBy=multi-user.target
