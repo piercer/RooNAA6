@@ -1,10 +1,6 @@
-// src/frame.rs
-
 pub const FRAME_HEADER_SIZE: usize = 32;
-pub const TYPE_PCM: u32 = 0x01;
 pub const TYPE_PIC: u32 = 0x04;
 pub const TYPE_META: u32 = 0x08;
-pub const TYPE_POS: u32 = 0x10;
 
 pub struct FrameHeader {
     pub raw: [u8; FRAME_HEADER_SIZE],
@@ -19,10 +15,6 @@ impl FrameHeader {
     pub fn has_meta(&self) -> bool {
         self.type_mask & TYPE_META != 0
     }
-
-    pub fn has_pic(&self) -> bool {
-        self.type_mask & TYPE_PIC != 0
-    }
 }
 
 pub struct StreamParams {
@@ -33,7 +25,6 @@ pub struct StreamParams {
 }
 
 /// Parse a 32-byte frame header. Returns None if buffer is too short.
-/// Preserves the full 32-byte raw header for serialization.
 pub fn parse_header(buf: &[u8]) -> Option<FrameHeader> {
     if buf.len() < FRAME_HEADER_SIZE {
         return None;
@@ -63,7 +54,7 @@ pub fn serialize_header(h: &FrameHeader) -> [u8; FRAME_HEADER_SIZE] {
 }
 
 /// Compute bytes_per_sample: max(1, bits / 8).
-/// PCM (bits=32) → 4. DSD (bits=1) → 1.
+/// PCM (bits=32) -> 4. DSD (bits=1) -> 1.
 pub fn bytes_per_sample(bits: u32) -> u32 {
     std::cmp::max(1, bits / 8)
 }
@@ -71,28 +62,29 @@ pub fn bytes_per_sample(bits: u32) -> u32 {
 /// Build the metadata section bytes for NAA v6.
 /// Format: `[metadata]\n` + key=value lines + `\0`
 ///
-/// `params` provides the format fields (bitrate, bits, channels, etc).
-/// Only whitelisted fields — the NAA endpoint rejects unknown fields.
+/// Only whitelisted fields -- the NAA endpoint rejects unknown fields.
 pub fn build_meta_section(
     params: &StreamParams,
     title: &str,
     artist: &str,
     album: &str,
 ) -> Vec<u8> {
+    use std::io::Write;
     let meta_rate = if params.is_dsd { 2822400 } else { params.rate };
     let bitrate = meta_rate as u64 * params.bits as u64 * 2;
-    let sdm = if params.is_dsd { 1 } else { 0 };
-    let content = format!(
-        "bitrate={}\nbits={}\nchannels=2\nfloat=0\nsamplerate={}\nsdm={}\nsong={}\nartist={}\nalbum={}\n",
-        bitrate, params.bits, meta_rate, sdm, title, artist, album
-    );
-    let mut section = format!("[metadata]\n{}", content).into_bytes();
+    let sdm = u32::from(params.is_dsd);
+    let mut section = Vec::with_capacity(256);
+    write!(
+        section,
+        "[metadata]\nbitrate={}\nbits={}\nchannels=2\nfloat=0\nsamplerate={}\nsdm={}\nsong={}\nartist={}\nalbum={}\n",
+        bitrate, params.bits, meta_rate, sdm, title, artist, album,
+    )
+    .unwrap();
     section.push(0x00);
     section
 }
 
 /// Parse an XML start message for stream parameters.
-/// Extracts bits="N", rate="N", stream="pcm|dsd" from the XML text.
 /// Returns None if this isn't a start message or lacks required attributes.
 pub fn parse_start_message(xml: &[u8]) -> Option<StreamParams> {
     let text = std::str::from_utf8(xml).ok()?;
@@ -101,8 +93,7 @@ pub fn parse_start_message(xml: &[u8]) -> Option<StreamParams> {
     }
     let bits = extract_xml_attr(text, "bits")?.parse::<u32>().ok()?;
     let rate = extract_xml_attr(text, "rate")?.parse::<u32>().ok()?;
-    let stream = extract_xml_attr(text, "stream").unwrap_or("pcm".to_string());
-    let is_dsd = stream == "dsd";
+    let is_dsd = extract_xml_attr(text, "stream").as_deref() == Some("dsd");
     Some(StreamParams {
         bits,
         rate,
@@ -111,17 +102,23 @@ pub fn parse_start_message(xml: &[u8]) -> Option<StreamParams> {
     })
 }
 
-/// Extract an XML attribute value: `name="value"` → `value`
+/// Extract an XML attribute value: ` name="value"` -> `value`.
+/// Space prefix prevents matching attribute name suffixes
+/// (e.g., searching for "rate" won't false-match "bitrate").
 fn extract_xml_attr(text: &str, name: &str) -> Option<String> {
-    let pattern = format!("{}=\"", name);
+    let pattern = format!(" {}=\"", name);
     let start = text.find(&pattern)? + pattern.len();
     let end = text[start..].find('"')? + start;
     Some(text[start..end].to_string())
 }
 
 /// Returns true if the header looks corrupt (sanity check).
+/// Guards against garbage lengths that would desync the state machine.
 pub fn is_corrupt(header: &FrameHeader) -> bool {
-    header.pcm_len > 1_000_000 || header.pos_len > 10_000
+    header.pcm_len > 1_000_000
+        || header.pos_len > 10_000
+        || header.meta_len > 100_000
+        || header.pic_len > 1_000_000
 }
 
 #[cfg(test)]
@@ -144,7 +141,6 @@ mod tests {
         assert_eq!(h.meta_len, 100);
         assert_eq!(h.pic_len, 5000);
         assert!(h.has_meta());
-        assert!(h.has_pic());
     }
 
     #[test]
@@ -158,7 +154,6 @@ mod tests {
         assert_eq!(h.type_mask, 0x11);
         assert_eq!(h.pcm_len, 602112);
         assert!(!h.has_meta());
-        assert!(!h.has_pic());
     }
 
     #[test]
@@ -216,7 +211,7 @@ mod tests {
         assert!(text.contains("song=My Song\n"));
         assert!(text.contains("artist=My Artist\n"));
         assert!(text.contains("album=My Album\n"));
-        assert!(section.last() == Some(&0x00));
+        assert_eq!(section.last(), Some(&0x00));
     }
 
     #[test]
@@ -298,5 +293,25 @@ mod tests {
             pic_len: 0,
         };
         assert!(!is_corrupt(&h3));
+
+        let h4 = FrameHeader {
+            raw: [0u8; FRAME_HEADER_SIZE],
+            type_mask: 0x1D,
+            pcm_len: 81920,
+            pos_len: 271,
+            meta_len: 200_000,
+            pic_len: 0,
+        };
+        assert!(is_corrupt(&h4));
+
+        let h5 = FrameHeader {
+            raw: [0u8; FRAME_HEADER_SIZE],
+            type_mask: 0x1D,
+            pcm_len: 81920,
+            pos_len: 271,
+            meta_len: 0,
+            pic_len: 2_000_000,
+        };
+        assert!(is_corrupt(&h5));
     }
 }

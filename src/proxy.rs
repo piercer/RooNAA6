@@ -1,14 +1,14 @@
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
 use crate::frame::{
     build_meta_section, is_corrupt, parse_header, parse_start_message, serialize_header,
-    StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC,
+    FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC,
 };
-use crate::metadata::SharedMetadata;
+use crate::metadata::{Metadata, SharedMetadata};
 use crate::ts;
 
-/// Forward NAA→HQP: simple byte passthrough with XML logging.
+/// Forward NAA->HQP: simple byte passthrough with XML logging.
 pub fn forward_passthrough(mut src: TcpStream, mut dst: TcpStream, label: &str) {
     let mut buf = [0u8; 65536];
     loop {
@@ -41,36 +41,122 @@ enum Phase {
     Skip,
 }
 
-/// Forward HQP→NAA: frame-level processing with metadata injection.
+struct FrameProcessor {
+    shared: SharedMetadata,
+    params: StreamParams,
+    phase: Phase,
+    pass_remaining: usize,
+    skip_remaining: usize,
+    pending_inject: Option<Vec<u8>>,
+    header_buf: Vec<u8>,
+    injected: bool,
+    last_title: Option<String>,
+    frame_count: u64,
+    strip_logged: bool,
+}
+
+impl FrameProcessor {
+    fn new(shared: SharedMetadata) -> Self {
+        Self {
+            shared,
+            params: StreamParams {
+                bits: 32,
+                rate: 44100,
+                is_dsd: false,
+                bytes_per_sample: 4,
+            },
+            phase: Phase::Header,
+            pass_remaining: 0,
+            skip_remaining: 0,
+            pending_inject: None,
+            header_buf: Vec::with_capacity(FRAME_HEADER_SIZE),
+            injected: false,
+            last_title: None,
+            frame_count: 0,
+            strip_logged: false,
+        }
+    }
+
+    fn reset_for_start(&mut self, params: StreamParams) {
+        self.params = params;
+        self.phase = Phase::Header;
+        self.injected = false;
+        self.last_title = None;
+        self.frame_count = 0;
+        self.strip_logged = false;
+        self.header_buf.clear();
+        self.pass_remaining = 0;
+        self.skip_remaining = 0;
+        self.pending_inject = None;
+    }
+
+    /// Build and set the injection payload. Returns JPEG size for logging.
+    fn inject(&mut self, header: &mut FrameHeader, meta: &Metadata, with_cover: bool) -> usize {
+        let meta_section =
+            build_meta_section(&self.params, &meta.title, &meta.artist, &meta.album);
+        header.type_mask |= TYPE_META;
+        header.meta_len = meta_section.len() as u32;
+
+        let mut payload = meta_section;
+        let mut jpeg_len = 0;
+        if with_cover {
+            if let Some(jpeg) = &meta.cover_art {
+                jpeg_len = jpeg.len();
+                header.type_mask |= TYPE_PIC;
+                header.pic_len = jpeg_len as u32;
+                payload.extend_from_slice(jpeg);
+            }
+        }
+        self.pending_inject = Some(payload);
+        self.last_title = Some(meta.title.clone());
+        jpeg_len
+    }
+
+    fn strip(&mut self, header: &mut FrameHeader) {
+        header.type_mask &= !(TYPE_META | TYPE_PIC);
+        header.meta_len = 0;
+        header.pic_len = 0;
+        self.pending_inject = None;
+    }
+}
+
+/// Handle XML data: log it, check for start messages, reset state, forward to dst.
+fn handle_xml(
+    proc: &mut FrameProcessor,
+    data: &[u8],
+    dst: &mut TcpStream,
+    label: &str,
+) -> io::Result<()> {
+    log_xml(label, data);
+    if let Some(params) = parse_start_message(data) {
+        eprintln!(
+            "{} [{}] start: {} bytes/sample, {} {}Hz",
+            ts(),
+            label,
+            params.bytes_per_sample,
+            if params.is_dsd { "dsd" } else { "pcm" },
+            params.rate,
+        );
+        proc.reset_for_start(params);
+    }
+    dst.write_all(data)
+}
+
+/// Forward HQP->NAA: frame-level processing with metadata injection.
 ///
 /// State machine processes NAA v6 binary frames, injecting Roon metadata
-/// and cover art into the audio stream so the T8 DAC displays track info.
+/// and cover art into the audio stream so the DAC displays track info.
 ///
 /// Actions:
-/// - INJECT: first META frame after start — inject title/artist/album + cover art
-/// - GAPLESS: track change during gapless playback — inject new metadata + cover
-/// - STRIP: HQPlayer sends its own META refresh — strip it to keep our metadata
-/// - REFRESH: periodic re-injection (~every 300 frames / ~30s) to prevent T8 revert
+/// - INJECT: first META frame after start -- inject title/artist/album + cover art
+/// - GAPLESS: track change during gapless playback -- inject new metadata + cover
+/// - STRIP: HQPlayer sends its own META refresh -- strip it to keep our metadata
+/// - REFRESH: periodic re-injection (~every 300 frames / ~30s) to prevent DAC revert
 /// - PASSTHROUGH: normal frames with no metadata work needed
 pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: SharedMetadata) {
     let label = "HQP->NAA";
     let mut buf = [0u8; 65536];
-
-    let mut phase = Phase::Header;
-    let mut pass_remaining: usize = 0;
-    let mut skip_remaining: usize = 0;
-    let mut pending_inject: Option<Vec<u8>> = None;
-    let mut header_buf = Vec::with_capacity(FRAME_HEADER_SIZE);
-    let mut stream_params = StreamParams {
-        bits: 32,
-        rate: 44100,
-        is_dsd: false,
-        bytes_per_sample: 4,
-    };
-    let mut injected_this_start = false;
-    let mut last_injected_title: Option<String> = None;
-    let mut frame_count: u64 = 0;
-    let mut strip_logged = false;
+    let mut proc = FrameProcessor::new(shared);
     let mut out = Vec::with_capacity(65536 + 4096);
 
     loop {
@@ -87,33 +173,11 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
         };
         let data = &buf[..n];
 
-        // Top-of-buffer XML check (before binary processing)
-        if phase == Phase::Header && header_buf.is_empty() {
-            // Find first non-whitespace byte
-            let first_non_ws = data.iter().position(|&b| !b.is_ascii_whitespace());
-            if let Some(idx) = first_non_ws {
+        // Top-of-buffer XML check (before binary frame processing)
+        if proc.phase == Phase::Header && proc.header_buf.is_empty() {
+            if let Some(idx) = data.iter().position(|&b| !b.is_ascii_whitespace()) {
                 if data[idx] == b'<' {
-                    log_xml(label, data);
-                    if let Some(params) = parse_start_message(data) {
-                        eprintln!(
-                            "{} [{}] start: {} bytes/sample, {} {}Hz",
-                            ts(),
-                            label,
-                            params.bytes_per_sample,
-                            if params.is_dsd { "dsd" } else { "pcm" },
-                            params.rate
-                        );
-                        stream_params = params;
-                        injected_this_start = false;
-                        last_injected_title = None;
-                        frame_count = 0;
-                        strip_logged = false;
-                        header_buf.clear();
-                        pass_remaining = 0;
-                        skip_remaining = 0;
-                        pending_inject = None;
-                    }
-                    if let Err(e) = dst.write_all(data) {
+                    if let Err(e) = handle_xml(&mut proc, data, &mut dst, label) {
                         eprintln!("{} [{}] write error: {}", ts(), label, e);
                         break;
                     }
@@ -127,11 +191,10 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
         out.clear();
 
         while pos < data.len() {
-            match phase {
+            match proc.phase {
                 Phase::Header => {
                     // Mid-buffer XML check
-                    if header_buf.is_empty() && data[pos] == b'<' {
-                        // Flush accumulated output
+                    if proc.header_buf.is_empty() && data[pos] == b'<' {
                         if !out.is_empty() {
                             if let Err(e) = dst.write_all(&out) {
                                 eprintln!("{} [{}] write error: {}", ts(), label, e);
@@ -139,28 +202,7 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                             }
                             out.clear();
                         }
-                        let xml_data = &data[pos..];
-                        log_xml(label, xml_data);
-                        if let Some(params) = parse_start_message(xml_data) {
-                            eprintln!(
-                                "{} [{}] start: {} bytes/sample, {} {}Hz",
-                                ts(),
-                                label,
-                                params.bytes_per_sample,
-                                if params.is_dsd { "dsd" } else { "pcm" },
-                                params.rate
-                            );
-                            stream_params = params;
-                            injected_this_start = false;
-                            last_injected_title = None;
-                            frame_count = 0;
-                            strip_logged = false;
-                            header_buf.clear();
-                            pass_remaining = 0;
-                            skip_remaining = 0;
-                            pending_inject = None;
-                        }
-                        if let Err(e) = dst.write_all(xml_data) {
+                        if let Err(e) = handle_xml(&mut proc, &data[pos..], &mut dst, label) {
                             eprintln!("{} [{}] write error: {}", ts(), label, e);
                             return;
                         }
@@ -168,198 +210,131 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                     }
 
                     // Accumulate header bytes (32 total)
-                    let need = FRAME_HEADER_SIZE - header_buf.len();
-                    let available = data.len() - pos;
-                    let take = std::cmp::min(need, available);
-                    header_buf.extend_from_slice(&data[pos..pos + take]);
+                    let need = FRAME_HEADER_SIZE - proc.header_buf.len();
+                    let take = need.min(data.len() - pos);
+                    proc.header_buf.extend_from_slice(&data[pos..pos + take]);
                     pos += take;
 
-                    if header_buf.len() == FRAME_HEADER_SIZE {
-                        let mut header = parse_header(&header_buf).expect("header_buf is FRAME_HEADER_SIZE");
-                        header_buf.clear();
+                    if proc.header_buf.len() < FRAME_HEADER_SIZE {
+                        continue;
+                    }
 
-                        if is_corrupt(&header) {
-                            eprintln!(
-                                "{} [CORRUPT] pcm_len={} pos_len={}",
-                                ts(),
-                                header.pcm_len,
-                                header.pos_len
-                            );
-                        }
+                    let mut header = parse_header(&proc.header_buf)
+                        .expect("header_buf is FRAME_HEADER_SIZE");
+                    proc.header_buf.clear();
 
-                        let pcm_bytes =
-                            header.pcm_len as usize * stream_params.bytes_per_sample as usize;
-                        let has_meta = header.has_meta();
+                    if is_corrupt(&header) {
+                        eprintln!(
+                            "{} [CORRUPT] pcm_len={} pos_len={} meta_len={} pic_len={}, closing",
+                            ts(),
+                            header.pcm_len,
+                            header.pos_len,
+                            header.meta_len,
+                            header.pic_len,
+                        );
+                        return;
+                    }
 
-                        let meta = shared.get();
-                        let title = &meta.title;
-                        frame_count += 1;
+                    let pcm_bytes =
+                        header.pcm_len as usize * proc.params.bytes_per_sample as usize;
+                    let pos_bytes = header.pos_len as usize;
+                    let orig_meta_len = header.meta_len as usize;
+                    let orig_pic_len = header.pic_len as usize;
+                    let has_meta = header.has_meta();
 
-                        // Save original lengths BEFORE any modification
-                        let orig_meta_len = header.meta_len as usize;
-                        let orig_pic_len = header.pic_len as usize;
+                    let meta = proc.shared.get();
+                    let title = &meta.title;
+                    proc.frame_count += 1;
 
-                        if !title.is_empty() && has_meta && !injected_this_start {
+                    // Decide action; replace_original means we strip the original meta/pic
+                    let replace_original =
+                        if !title.is_empty() && has_meta && !proc.injected {
                             // INJECT: first META frame after start
-                            let meta_section = build_meta_section(
-                                &stream_params,
-                                title,
-                                &meta.artist,
-                                &meta.album,
-                            );
-                            let jpeg = shared.get_cover_art();
-                            let jpeg_len = jpeg.as_ref().map_or(0, |j| j.len());
-
-                            header.type_mask |= TYPE_META;
-                            if jpeg.is_some() {
-                                header.type_mask |= TYPE_PIC;
-                            }
-                            header.meta_len = meta_section.len() as u32;
-                            header.pic_len = jpeg_len as u32;
-
-                            let mut inject = meta_section;
-                            if let Some(j) = jpeg {
-                                inject.extend_from_slice(&j);
-                            }
-                            pending_inject = Some(inject);
-                            injected_this_start = true;
-                            last_injected_title = Some(title.clone());
-                            pass_remaining = pcm_bytes + header.pos_len as usize;
-                            skip_remaining = orig_meta_len + orig_pic_len;
-
+                            let jpeg_len = proc.inject(&mut header, &meta, true);
+                            proc.injected = true;
                             eprintln!(
                                 "{} [INJECT] {} / {} / {} + {}b cover",
-                                ts(),
-                                title,
-                                meta.artist,
-                                meta.album,
-                                jpeg_len
+                                ts(), title, meta.artist, meta.album, jpeg_len,
                             );
+                            true
                         } else if !title.is_empty()
-                            && injected_this_start
-                            && last_injected_title.as_deref() != Some(title)
+                            && proc.injected
+                            && proc.last_title.as_deref() != Some(title)
                         {
                             // GAPLESS: track changed during gapless playback
-                            let meta_section = build_meta_section(
-                                &stream_params,
-                                title,
-                                &meta.artist,
-                                &meta.album,
-                            );
-                            let jpeg = shared.get_cover_art();
-                            let jpeg_len = jpeg.as_ref().map_or(0, |j| j.len());
-
-                            header.type_mask |= TYPE_META;
-                            if jpeg.is_some() {
-                                header.type_mask |= TYPE_PIC;
-                            }
-                            header.meta_len = meta_section.len() as u32;
-                            header.pic_len = jpeg_len as u32;
-
-                            let mut inject = meta_section;
-                            if let Some(j) = jpeg {
-                                inject.extend_from_slice(&j);
-                            }
-                            pending_inject = Some(inject);
-                            last_injected_title = Some(title.clone());
-                            pass_remaining = pcm_bytes + header.pos_len as usize;
-                            skip_remaining = orig_meta_len + orig_pic_len;
-
+                            let jpeg_len = proc.inject(&mut header, &meta, true);
                             eprintln!(
                                 "{} [GAPLESS] {} / {} / {} + {}b cover",
-                                ts(),
-                                title,
-                                meta.artist,
-                                meta.album,
-                                jpeg_len
+                                ts(), title, meta.artist, meta.album, jpeg_len,
                             );
-                        } else if has_meta && injected_this_start {
-                            // STRIP: HQPlayer sent a META refresh — strip it
-                            header.type_mask &= !TYPE_META;
-                            header.type_mask &= !TYPE_PIC;
-                            header.meta_len = 0;
-                            header.pic_len = 0;
-                            pending_inject = None;
-                            pass_remaining = pcm_bytes + header.pos_len as usize;
-                            skip_remaining = orig_meta_len + orig_pic_len;
-
-                            if !strip_logged {
+                            true
+                        } else if has_meta && proc.injected {
+                            // STRIP: HQPlayer META refresh -- strip to keep our metadata
+                            proc.strip(&mut header);
+                            if !proc.strip_logged {
                                 eprintln!(
                                     "{} [STRIP] META refresh stripped (frame {})",
                                     ts(),
-                                    frame_count
+                                    proc.frame_count,
                                 );
-                                strip_logged = true;
+                                proc.strip_logged = true;
                             }
-                        } else if injected_this_start
+                            true
+                        } else if proc.injected
                             && !title.is_empty()
-                            && frame_count % 300 == 0
+                            && proc.frame_count % 300 == 0
                         {
                             // REFRESH: periodic re-injection (~30s)
-                            let meta_section = build_meta_section(
-                                &stream_params,
-                                title,
-                                &meta.artist,
-                                &meta.album,
-                            );
-
-                            header.type_mask |= TYPE_META;
-                            header.meta_len = meta_section.len() as u32;
-                            // Don't touch pic_len — no cover art on refresh
-
-                            pending_inject = Some(meta_section);
-                            last_injected_title = Some(title.clone());
-                            pass_remaining = pcm_bytes + header.pos_len as usize;
-                            skip_remaining = orig_meta_len + orig_pic_len;
-
+                            proc.inject(&mut header, &meta, false);
                             eprintln!(
                                 "{} [REFRESH] {} (frame {})",
-                                ts(),
-                                title,
-                                frame_count
+                                ts(), title, proc.frame_count,
                             );
+                            true
                         } else {
                             // PASSTHROUGH: no metadata work needed
-                            pending_inject = None;
-                            pass_remaining = pcm_bytes
-                                + header.pos_len as usize
-                                + orig_meta_len
-                                + orig_pic_len;
-                            skip_remaining = 0;
-                        }
+                            proc.pending_inject = None;
+                            false
+                        };
 
-                        out.extend_from_slice(&serialize_header(&header));
-                        phase = Phase::Pass;
+                    if replace_original {
+                        proc.pass_remaining = pcm_bytes + pos_bytes;
+                        proc.skip_remaining = orig_meta_len + orig_pic_len;
+                    } else {
+                        proc.pass_remaining =
+                            pcm_bytes + pos_bytes + orig_meta_len + orig_pic_len;
+                        proc.skip_remaining = 0;
                     }
+
+                    out.extend_from_slice(&serialize_header(&header));
+                    proc.phase = Phase::Pass;
                 }
 
                 Phase::Pass => {
-                    let available = data.len() - pos;
-                    let take = std::cmp::min(available, pass_remaining);
+                    let take = proc.pass_remaining.min(data.len() - pos);
                     out.extend_from_slice(&data[pos..pos + take]);
                     pos += take;
-                    pass_remaining -= take;
+                    proc.pass_remaining -= take;
 
-                    if pass_remaining == 0 {
-                        if let Some(inject) = pending_inject.take() {
+                    if proc.pass_remaining == 0 {
+                        if let Some(inject) = proc.pending_inject.take() {
                             out.extend_from_slice(&inject);
                         }
-                        if skip_remaining > 0 {
-                            phase = Phase::Skip;
+                        proc.phase = if proc.skip_remaining > 0 {
+                            Phase::Skip
                         } else {
-                            phase = Phase::Header;
-                        }
+                            Phase::Header
+                        };
                     }
                 }
 
                 Phase::Skip => {
-                    let available = data.len() - pos;
-                    let take = std::cmp::min(available, skip_remaining);
+                    let take = proc.skip_remaining.min(data.len() - pos);
                     pos += take; // discard bytes
-                    skip_remaining -= take;
+                    proc.skip_remaining -= take;
 
-                    if skip_remaining == 0 {
-                        phase = Phase::Header;
+                    if proc.skip_remaining == 0 {
+                        proc.phase = Phase::Header;
                     }
                 }
             }
