@@ -76,8 +76,8 @@ fn main() {
 
         let client_r = client.try_clone().unwrap();
         let naa_r = naa.try_clone().unwrap();
-        let client_w = client;
-        let naa_w = naa;
+        let client_w = client.try_clone().unwrap();
+        let naa_w = naa.try_clone().unwrap();
         let shared_clone = shared.clone();
 
         let t1 = thread::Builder::new()
@@ -91,6 +91,9 @@ fn main() {
             .unwrap();
 
         t1.join().unwrap();
+        // HQP disconnected — shut down both sockets so naa-to-hqp unblocks
+        let _ = client.shutdown(std::net::Shutdown::Both);
+        let _ = naa.shutdown(std::net::Shutdown::Both);
         t2.join().unwrap();
         eprintln!("{} Session ended", ts());
     }

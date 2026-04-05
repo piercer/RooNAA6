@@ -1,5 +1,4 @@
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, UdpSocket};
 
 use crate::{ts, NAA_PORT};
 
@@ -16,10 +15,7 @@ network audio\
 </networkaudio>\n";
 
 pub fn run(bind_addr: Ipv4Addr) {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
-    sock.set_reuse_address(true).unwrap();
-    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, NAA_PORT);
-    sock.bind(&SockAddr::from(addr)).unwrap();
+    let sock = UdpSocket::bind(("0.0.0.0", NAA_PORT)).unwrap();
 
     for mcast in &MCAST_ADDRS {
         if let Err(e) = sock.join_multicast_v4(mcast, &bind_addr) {
@@ -36,15 +32,13 @@ pub fn run(bind_addr: Ipv4Addr) {
 
     let mut buf = [0u8; 4096];
     loop {
-        match sock.recv_from(unsafe {
-            &mut *(buf.as_mut_slice() as *mut [u8] as *mut [std::mem::MaybeUninit<u8>])
-        }) {
+        match sock.recv_from(&mut buf) {
             Ok((len, addr)) => {
                 let data = &buf[..len];
                 if data.windows(8).any(|w| w == b"discover")
                     && data.windows(13).any(|w| w == b"network audio")
                 {
-                    eprintln!("{} [discovery] responded to {}", ts(), addr.as_socket().unwrap());
+                    eprintln!("{} [discovery] responded to {}", ts(), addr);
                     let _ = sock.send_to(DISCOVER_RESPONSE, &addr);
                 }
             }
