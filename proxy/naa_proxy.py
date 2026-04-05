@@ -1,4 +1,4 @@
-import socket, threading, datetime, struct, os, json, sys, time
+import socket, threading, datetime, struct, os, json, sys, time, re
 sys.path.insert(0, os.path.expanduser('~/.local/lib/python3'))
 import urllib.request
 try:
@@ -52,95 +52,6 @@ def load_cover_art():
     with _meta_lock:
         return _cover_art
 
-def patch_frame_header(data, jpeg_len):
-    """Patch the NAA v6 frame header to include picture length.
-
-    Frame header format (32 bytes, little-endian):
-      offset 0:  type bitmask (0x01=PCM, 0x04=PIC, 0x08=META, 0x10=POS)
-      offset 4:  PCM data length
-      offset 8:  position section length
-      offset 12: metadata section length
-      offset 16: picture data length
-      offset 20: padding (zeros)
-
-    We need to:
-      - Set PIC bit (0x04) in the type byte
-      - Write JPEG length at offset 16-19
-    """
-    buf = bytearray(data)
-    # Set PIC bit in type byte
-    buf[0] = buf[0] | 0x04
-    # Write picture length
-    struct.pack_into('<I', buf, 16, jpeg_len)
-    return bytes(buf)
-
-def replace_metadata_section(data):
-    """Replace song= value in [metadata] section with Roon title, keeping exact same byte count.
-
-    Preserves all format fields (bitrate, bits, channels, etc.) — the T8 requires them.
-    Only the song= line is replaced. Artist/album added if space permits.
-    """
-    marker = b'\x00[metadata]\n'
-    mpos = data.find(marker)
-    if mpos == -1:
-        return data, False
-
-    section_start = mpos + len(marker)
-    section_end = data.find(b'\x00', section_start)
-    if section_end == -1:
-        return data, False
-
-    target_len = section_end - section_start
-    original = data[section_start:section_end]
-
-    meta = get_roon_metadata()
-    title = meta.get("title", "")
-    if not title:
-        return data, False
-
-    # Parse original content: keep essential format fields, replace song=
-    # Drop bitrate/float/sdm to free space for title/artist/album
-    keep_fields = {b'samplerate='}
-    lines = original.split(b'\n')
-    new_lines = []
-    for line in lines:
-        if not line:
-            continue
-        if line.startswith(b'song='):
-            new_lines.append(f'song={title}'.encode())
-        elif any(line.startswith(f) for f in keep_fields):
-            new_lines.append(line)
-        # drop bitrate=, float=, sdm= to save space
-
-    # Add artist/album after format fields if there's room
-    artist = meta.get("artist", "")
-    album = meta.get("album", "")
-    if artist:
-        new_lines.append(f'artist={artist}'.encode())
-    if album:
-        new_lines.append(f'album={album}'.encode())
-
-    new_content = b'\n'.join(new_lines) + b'\n'
-
-    # Trim artist/album if too long
-    while len(new_content) > target_len and new_lines and new_lines[-1].startswith(b'album='):
-        new_lines.pop()
-        new_content = b'\n'.join(new_lines) + b'\n'
-    while len(new_content) > target_len and new_lines and new_lines[-1].startswith(b'artist='):
-        new_lines.pop()
-        new_content = b'\n'.join(new_lines) + b'\n'
-
-    # Truncate title if still too long
-    if len(new_content) > target_len:
-        new_content = new_content[:target_len - 1] + b'\n'
-
-    # Pad to exact target length
-    if len(new_content) < target_len:
-        new_content = new_content + b' ' * (target_len - len(new_content))
-
-    modified = data[:section_start] + new_content + data[section_end:]
-    return modified, True
-
 def discovery_responder():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -166,7 +77,8 @@ def forward_hqp_to_t8(src, dst):
     """Forward HQPlayer->T8 with frame-level metadata injection.
 
     First frame after start: inject Roon metadata (variable size, with format fields).
-    Subsequent META frames: strip them so T8 keeps our first-frame metadata.
+    Gapless track change: when Roon reports new track, inject metadata into next frame.
+    Subsequent META frames: strip them so T8 keeps our injected metadata.
     """
     PHASE_HEADER = 0
     PHASE_PASS = 1
@@ -180,6 +92,8 @@ def forward_hqp_to_t8(src, dst):
     bytes_per_sample = 4
     meta_template = b'bitrate=1411200\nbits=16\nchannels=2\nfloat=0\nsamplerate=44100\nsdm=0\nsong=Roon\n'
     injected_this_start = False
+    last_injected_title = None
+    frame_count = 0
 
     try:
         while True:
@@ -188,7 +102,7 @@ def forward_hqp_to_t8(src, dst):
                 print(f"{ts()} [HQP->T8] EOF", flush=True)
                 break
 
-            if data.lstrip().startswith(b'<'):
+            if phase == PHASE_HEADER and not header_buf and data.lstrip().startswith(b'<'):
                 log_xml("HQP->T8", data)
                 if b'type="start"' in data and b'result=' not in data:
                     phase = PHASE_HEADER
@@ -196,8 +110,8 @@ def forward_hqp_to_t8(src, dst):
                     skip_remaining = 0
                     pending_inject = None
                     injected_this_start = False
+                    last_injected_title = None
                     header_buf = b''
-                    import re
                     m = re.search(rb'bits="(\d+)"', data)
                     if m:
                         bytes_per_sample = int(m.group(1)) // 8
@@ -211,6 +125,27 @@ def forward_hqp_to_t8(src, dst):
 
             while pos < len(data):
                 if phase == PHASE_HEADER:
+                    # Check for XML message mid-buffer (e.g. stop/start between frames)
+                    if not header_buf and data[pos:pos+1] == b'<':
+                        if out:
+                            dst.sendall(bytes(out))
+                            out = bytearray()
+                        xml_data = data[pos:]
+                        log_xml("HQP->T8", xml_data)
+                        if b'type="start"' in xml_data and b'result=' not in xml_data:
+                            pass_remaining = 0
+                            skip_remaining = 0
+                            pending_inject = None
+                            injected_this_start = False
+                            last_injected_title = None
+                            frame_count = 0
+                            m = re.search(rb'bits="(\d+)"', xml_data)
+                            if m:
+                                bytes_per_sample = int(m.group(1)) // 8
+                                print(f"{ts()} [HQP->T8] start: {bytes_per_sample} bytes/sample", flush=True)
+                        dst.sendall(xml_data)
+                        break
+
                     need = 32 - len(header_buf)
                     take = min(need, len(data) - pos)
                     header_buf += data[pos:pos+take]
@@ -228,6 +163,10 @@ def forward_hqp_to_t8(src, dst):
                         has_meta = bool(header[0] & 0x08)
                         meta = get_roon_metadata()
                         title = meta.get("title", "")
+                        frame_count += 1
+
+                        if pcm_len > 100000 or pos_len > 10000:
+                            print(f"{ts()} [CORRUPT] header hex: {header.hex()}", flush=True)
 
                         if title and has_meta and not injected_this_start:
                             # First META frame after start: variable-size injection
@@ -248,19 +187,67 @@ def forward_hqp_to_t8(src, dst):
 
                             pending_inject = meta_section + (jpeg if jpeg else b'')
                             injected_this_start = True
+                            last_injected_title = title
                             pass_remaining = pcm_bytes + pos_len
                             skip_remaining = meta_len + pic_len
                             cover_size = len(jpeg) if jpeg else 0
                             print(f"{ts()} [INJECT] {title} / {meta.get('artist', '?')} / {meta.get('album', '?')} + {cover_size}b cover", flush=True)
 
+                        elif title and injected_this_start and title != last_injected_title:
+                            # Gapless track change: Roon reports new track, inject metadata
+                            # HQPlayer does exactly this — sends 0x1D frame at track boundaries
+                            lines = meta_template.split(b'\n')
+                            format_lines = [l for l in lines if l and not l.startswith(b'song=')]
+                            new_lines = format_lines + [
+                                f'song={title}'.encode(),
+                                f'artist={meta.get("artist","")}'.encode(),
+                                f'album={meta.get("album","")}'.encode(),
+                            ]
+                            content = b'\n'.join(new_lines) + b'\n'
+                            meta_section = b'[metadata]\n' + content + b'\x00'
+                            jpeg = load_cover_art()
+
+                            header[0] = header[0] | 0x08 | (0x04 if jpeg else 0)
+                            struct.pack_into('<I', header, 12, len(meta_section))
+                            struct.pack_into('<I', header, 16, len(jpeg) if jpeg else 0)
+
+                            pending_inject = meta_section + (jpeg if jpeg else b'')
+                            last_injected_title = title
+                            pass_remaining = pcm_bytes + pos_len
+                            skip_remaining = meta_len + pic_len
+                            cover_size = len(jpeg) if jpeg else 0
+                            print(f"{ts()} [GAPLESS] {title} / {meta.get('artist', '?')} / {meta.get('album', '?')} + {cover_size}b cover", flush=True)
+
                         elif has_meta and injected_this_start:
-                            # Mid-stream META refresh: strip it to keep our metadata
+                            # Mid-stream META refresh: strip to keep our metadata
                             header[0] = header[0] & ~0x08 & ~0x04
                             struct.pack_into('<I', header, 12, 0)
                             struct.pack_into('<I', header, 16, 0)
                             pending_inject = None
                             pass_remaining = pcm_bytes + pos_len
                             skip_remaining = meta_len + pic_len
+                            print(f"{ts()} [STRIP] META refresh stripped (frame {frame_count})", flush=True)
+
+                        elif injected_this_start and title and frame_count % 300 == 0:
+                            # Periodic metadata refresh (~30s) to prevent T8 display revert
+                            lines = meta_template.split(b'\n')
+                            format_lines = [l for l in lines if l and not l.startswith(b'song=')]
+                            new_lines = format_lines + [
+                                f'song={title}'.encode(),
+                                f'artist={meta.get("artist","")}'.encode(),
+                                f'album={meta.get("album","")}'.encode(),
+                            ]
+                            content = b'\n'.join(new_lines) + b'\n'
+                            meta_section = b'[metadata]\n' + content + b'\x00'
+
+                            header[0] = header[0] | 0x08
+                            struct.pack_into('<I', header, 12, len(meta_section))
+
+                            pending_inject = meta_section
+                            last_injected_title = title
+                            pass_remaining = pcm_bytes + pos_len
+                            skip_remaining = meta_len + pic_len
+                            print(f"{ts()} [REFRESH] {title} (frame {frame_count})", flush=True)
 
                         else:
                             pending_inject = None
