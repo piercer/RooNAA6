@@ -1,42 +1,34 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 #[derive(Clone, Default)]
 pub struct Metadata {
     pub title: String,
     pub artist: String,
     pub album: String,
-    pub image_key: String,
-    pub cover_art: Option<Vec<u8>>,
+    pub cover_art: Option<Arc<Vec<u8>>>,
 }
 
+/// Thread-safe shared metadata, read-optimised via RwLock.
+///
+/// Cover art uses Arc<Vec<u8>> so get() clones the refcount (O(1))
+/// rather than copying the entire JPEG on every frame.
 #[derive(Clone)]
 pub struct SharedMetadata {
-    inner: Arc<Mutex<Metadata>>,
+    inner: Arc<RwLock<Metadata>>,
 }
 
 impl SharedMetadata {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Metadata::default())),
+            inner: Arc::new(RwLock::new(Metadata::default())),
         }
     }
 
     pub fn get(&self) -> Metadata {
-        let inner = self.inner.lock().unwrap();
-        Metadata {
-            title: inner.title.clone(),
-            artist: inner.artist.clone(),
-            album: inner.album.clone(),
-            image_key: inner.image_key.clone(),
-            cover_art: None, // use get_cover_art() for the expensive JPEG clone
-        }
+        self.inner.read().unwrap().clone()
     }
 
     pub fn set(&self, meta: Metadata) {
-        *self.inner.lock().unwrap() = meta;
-    }
-
-    pub fn get_cover_art(&self) -> Option<Vec<u8>> {
-        self.inner.lock().unwrap().cover_art.clone()
+        *self.inner.write().unwrap() = meta;
     }
 }

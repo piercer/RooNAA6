@@ -1,7 +1,7 @@
 mod config;
-mod metadata;
 mod discovery;
 mod frame;
+mod metadata;
 mod proxy;
 mod roon;
 
@@ -12,13 +12,12 @@ pub fn ts() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
     let secs = now.as_secs() % 86400;
-    let millis = now.as_millis() % 1000;
     format!(
         "{:02}:{:02}:{:02}.{:03}",
         secs / 3600,
         (secs % 3600) / 60,
         secs % 60,
-        millis
+        now.subsec_millis(),
     )
 }
 
@@ -35,14 +34,11 @@ fn main() {
 
     let shared = metadata::SharedMetadata::new();
 
-    let roon_host = cfg.roon.host.clone();
-    let roon_port = cfg.roon.port;
-    let zone_name = cfg.roon.zone.clone();
-    let token_file = cfg.roon.token_file.clone();
+    let roon_cfg = cfg.roon;
     let shared_roon = shared.clone();
     std::thread::Builder::new()
         .name("roon".into())
-        .spawn(move || roon::run(shared_roon, &roon_host, roon_port, &zone_name, &token_file))
+        .spawn(move || roon::run(shared_roon, &roon_cfg))
         .unwrap();
 
     let naa_host = cfg.naa.host;
@@ -54,7 +50,7 @@ fn main() {
         ts(),
         naa_port,
         naa_host,
-        naa_port
+        naa_port,
     );
 
     for stream in listener.incoming() {
@@ -65,7 +61,10 @@ fn main() {
                 continue;
             }
         };
-        let addr = client.peer_addr().unwrap();
+        let addr = client
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".into());
         eprintln!("{} HQP connected from {}", ts(), addr);
 
         let naa = match std::net::TcpStream::connect((&*naa_host, naa_port)) {
@@ -76,26 +75,46 @@ fn main() {
             }
         };
 
+        client.set_nodelay(true).ok();
+        naa.set_nodelay(true).ok();
+
         let client_r = client.try_clone().unwrap();
         let naa_r = naa.try_clone().unwrap();
         let client_w = client.try_clone().unwrap();
         let naa_w = naa.try_clone().unwrap();
         let shared_clone = shared.clone();
 
+        // First thread to finish triggers teardown of both sockets,
+        // preventing a deadlock when one side disconnects while the other is idle.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let done_tx2 = done_tx.clone();
+
         let t1 = std::thread::Builder::new()
             .name("hqp-to-naa".into())
-            .spawn(move || proxy::forward_hqp_to_naa(client_r, naa_w, shared_clone))
+            .spawn(move || {
+                proxy::forward_hqp_to_naa(client_r, naa_w, shared_clone);
+                let _ = done_tx.send(());
+            })
             .unwrap();
 
         let t2 = std::thread::Builder::new()
             .name("naa-to-hqp".into())
-            .spawn(move || proxy::forward_passthrough(naa_r, client_w, "NAA->HQP"))
+            .spawn(move || {
+                proxy::forward_passthrough(naa_r, client_w, "NAA->HQP");
+                let _ = done_tx2.send(());
+            })
             .unwrap();
 
-        t1.join().unwrap();
+        let _ = done_rx.recv();
         let _ = client.shutdown(std::net::Shutdown::Both);
         let _ = naa.shutdown(std::net::Shutdown::Both);
-        t2.join().unwrap();
+
+        if let Err(e) = t1.join() {
+            eprintln!("{} hqp-to-naa panicked: {:?}", ts(), e);
+        }
+        if let Err(e) = t2.join() {
+            eprintln!("{} naa-to-hqp panicked: {:?}", ts(), e);
+        }
         eprintln!("{} Session ended", ts());
     }
 }
