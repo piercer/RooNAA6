@@ -51,7 +51,7 @@ mcast_iface = "192.168.30.212"  # Interface IP for multicast discovery
 host = "192.168.30.23"          # IP of the Roon Core
 # port = 9330                   # Roon HTTP/WebSocket port (default: 9330)
 zone = "Einstein"               # Roon zone name to monitor
-# token_file = "/tmp/roon_token.json"  # Auth token persistence (default)
+# token_file = "/etc/roonaa6/roon_token.json"  # Auth token persistence (default)
 ```
 
 ## Install from .deb package
@@ -59,7 +59,7 @@ zone = "Einstein"               # Roon zone name to monitor
 Download the `.deb` from the [releases page](https://github.com/piercer/RooNAA6/releases) and install:
 
 ```bash
-sudo dpkg -i roonaa6_0.1.0-1_amd64.deb
+sudo dpkg -i roonaa6_1.0.0-1_amd64.deb
 ```
 
 This installs:

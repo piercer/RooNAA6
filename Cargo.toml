@@ -1,9 +1,9 @@
 [package]
 name = "RooNAA6"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
 description = "NAA v6 metadata-injecting proxy for HQPlayer → NAA endpoint"
-license = "MIT"
+license-file = "LICENSE"
 authors = ["Conrad"]
 
 [[bin]]
@@ -16,6 +16,10 @@ serde_json = "1"
 toml = "0.8"
 ureq = "3"
 tungstenite = "0.26"
+
+[profile.release]
+lto = true
+codegen-units = 1
 
 [package.metadata.deb]
 maintainer = "Conrad"
