@@ -7,7 +7,7 @@ Transparent TCP proxy that sits between HQPlayer and an NAA v6 endpoint (e.g. Ev
 When using Roon with HQPlayer as an audio output, the signal chain is:
 
 ```
-Roon Core → HQPlayer → NAA endpoint (DAC)
+Roon Core → HQPlayer → NAA endpoint
 ```
 
 HQPlayer communicates with NAA endpoints using the NAA v6 protocol, which supports rich metadata (track title, artist, album, cover art). However, Roon only sends audio to HQPlayer — it doesn't pass track metadata through HQPlayer's pipeline. The result: your DAC displays nothing useful (typically just "Roon" or silence) even though Roon knows exactly what's playing.
@@ -17,7 +17,7 @@ RooNAA6 solves this by sitting between HQPlayer and the NAA endpoint, independen
 ## How it works
 
 ```
-Roon Core ──> HQPlayer ──> RooNAA6 proxy ──> NAA endpoint (T8)
+Roon Core ──> HQPlayer ──> RooNAA6 proxy ──> NAA endpoint
                               │
                               └── Roon Core WebSocket (metadata)
 ```
@@ -27,13 +27,13 @@ Roon Core ──> HQPlayer ──> RooNAA6 proxy ──> NAA endpoint (T8)
 - Proxy connects to Roon Core via WebSocket to get track metadata (title, artist, album, cover art)
 - On the first audio frame after playback starts, proxy injects metadata + cover art into the NAA v6 binary stream
 - Subsequent metadata from HQPlayer is stripped to keep the Roon metadata visible
-- Periodic refresh every ~30s prevents the DAC from reverting
+- Periodic refresh every ~30s prevents the endpoint from reverting
 
-Handles PCM (up to 768kHz) and DSD (up to DSD512). Gapless track changes are detected via Roon zone subscription and metadata is re-injected at track boundaries.
+Handles PCM and DSD. Gapless track changes are detected via Roon zone subscription and metadata is re-injected at track boundaries.
 
 ## Network requirements
 
-The proxy and HQPlayer must run on **different machines** because the NAA control port (43210) is fixed and cannot be changed. The proxy listens on 43210 and forwards to HQPlayer's NAA endpoint on another IP.
+The proxy typically runs on the **same machine** as HQPlayer. Both the proxy and the NAA endpoint use port 43210, so the proxy binds locally and forwards to the real NAA endpoint on the network. The proxy can also run on a separate machine if needed.
 
 The proxy also handles NAA multicast discovery (224.0.0.199, 239.192.0.199) so HQPlayer sees it in the device dropdown.
 
@@ -100,7 +100,7 @@ On first launch, the proxy registers as a Roon extension called "RooNAA6 Metadat
 
 1. Open Roon → Settings → Extensions
 2. Find "RooNAA6 Metadata" and click Enable
-3. The proxy saves the auth token to `/tmp/roon_token.json` for subsequent runs (configurable via `token_file`)
+3. The proxy saves the auth token to `/etc/roonaa6/roon_token.json` for subsequent runs (configurable via `token_file`)
 
 ## HQPlayer setup
 
