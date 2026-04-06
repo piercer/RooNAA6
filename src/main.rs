@@ -42,7 +42,7 @@ fn main() {
         .unwrap();
 
     let naa_host = cfg.naa.host;
-    let naa_port = cfg.naa.port;
+    let naa_port = discovery::NAA_PORT;
 
     let listener = std::net::TcpListener::bind(("0.0.0.0", naa_port)).unwrap();
     eprintln!(

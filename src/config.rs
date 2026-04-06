@@ -11,8 +11,6 @@ pub struct Config {
 #[derive(Deserialize)]
 pub struct NaaConfig {
     pub host: String,
-    #[serde(default = "default_naa_port")]
-    pub port: u16,
     pub mcast_iface: Ipv4Addr,
 }
 
@@ -24,10 +22,6 @@ pub struct RoonConfig {
     pub zone: String,
     #[serde(default = "default_token_file")]
     pub token_file: String,
-}
-
-fn default_naa_port() -> u16 {
-    43210
 }
 
 fn default_roon_port() -> u16 {

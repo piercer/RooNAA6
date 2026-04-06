@@ -44,7 +44,6 @@ Copy `config.toml.example` to `config.toml` and edit:
 ```toml
 [naa]
 host = "192.168.30.109"         # IP of the real NAA endpoint (e.g. T8)
-# port = 43210                  # NAA port (default: 43210)
 mcast_iface = "192.168.30.212"  # Interface IP for multicast discovery
 
 [roon]
