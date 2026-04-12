@@ -95,12 +95,6 @@ pub(crate) enum Action {
     Passthrough,
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) enum PosAction {
-    Inject,
-    Passthrough,
-}
-
 pub(crate) struct FrameProcessor {
     pub(crate) shared: SharedMetadata,
     pub(crate) params: StreamParams,
@@ -108,7 +102,9 @@ pub(crate) struct FrameProcessor {
     pub(crate) header_buf: Vec<u8>,
     pub(crate) injected: bool,
     pub(crate) last_title: Option<String>,
-    pub(crate) last_pos_state: Option<crate::metadata::PlayState>,
+    /// (length, seek rounded to integer seconds, state) last emitted as POS.
+    /// Used to decide whether the current frame needs a fresh POS section.
+    pub(crate) last_pos_key: Option<(u32, u32, crate::metadata::PlayState)>,
     pub(crate) frame_count: u64,
     pub(crate) strip_logged: bool,
     pub(crate) pending_meta_pic: Option<Vec<u8>>,
@@ -128,7 +124,7 @@ impl FrameProcessor {
             header_buf: Vec::with_capacity(FRAME_HEADER_SIZE),
             injected: false,
             last_title: None,
-            last_pos_state: None,
+            last_pos_key: None,
             frame_count: 0,
             strip_logged: false,
             pending_meta_pic: None,
@@ -139,7 +135,7 @@ impl FrameProcessor {
         self.params = params;
         self.injected = false;
         self.last_title = None;
-        self.last_pos_state = None;
+        self.last_pos_key = None;
         self.frame_count = 0;
         self.strip_logged = false;
         self.header_buf.clear();
@@ -202,37 +198,6 @@ impl FrameProcessor {
         }
     }
 
-    /// Pure decision: given current playback position, decide whether to inject
-    /// a new [position] section this frame.
-    ///
-    /// HQPlayer's own NAA output emits POS every ~10 audio frames (verified
-    /// 2026-04-12 via capture_proxy on einstein: mean gap 10.9 frames across
-    /// 17 POS sections, ~2.33s wall-clock at 81920 samples/frame × 384kHz).
-    /// Matching that cadence is the "mimic HQPlayer exactly" rule — T8 is
-    /// tuned to that rate. Also inject immediately on first sight and on
-    /// state transitions so the display catches up promptly.
-    pub(crate) fn decide_pos_action(
-        &self,
-        pos: Option<&crate::metadata::PlaybackPosition>,
-    ) -> PosAction {
-        const POS_CADENCE_FRAMES: u64 = 10;
-
-        let Some(pos) = pos else {
-            return PosAction::Passthrough;
-        };
-
-        if self.last_pos_state.is_none() {
-            return PosAction::Inject;
-        }
-        if self.last_pos_state != Some(pos.state) {
-            return PosAction::Inject;
-        }
-        if self.frame_count % POS_CADENCE_FRAMES == 0 {
-            return PosAction::Inject;
-        }
-        PosAction::Passthrough
-    }
-
     /// Build the op sequence for one frame's body (everything after the header).
     /// Mutates `header` to reflect final meta_len/pic_len values.
     /// The header serialisation itself is pushed by the caller.
@@ -247,7 +212,6 @@ impl FrameProcessor {
 
         let meta = self.shared.get();
         let title = meta.title.clone();
-        let pos_ref = meta.position.as_ref();
 
         // --- Meta/pic decision (unchanged) ---
         let action = self.decide_action(has_meta, &title);
@@ -292,36 +256,53 @@ impl FrameProcessor {
         };
 
         // --- POS decision ---
-        let pos_action = self.decide_pos_action(pos_ref);
-        let (pos_bytes, replace_pos): (Vec<u8>, bool) = match pos_action {
-            PosAction::Inject => {
-                let pos = pos_ref.expect("decide_pos_action returned Inject only when Some");
-                let bytes = build_pos_section(pos, std::time::Instant::now());
-                if self.last_pos_state.is_none() {
-                    eprintln!(
-                        "{} [POS] first inject: len={} state={:?} pos={} length={}",
-                        ts(), bytes.len(), pos.state, pos.position_seconds, pos.length_seconds,
-                    );
-                }
-                header.pos_len = bytes.len() as u32;
-                header.type_mask |= TYPE_POS;
-                self.last_pos_state = Some(pos.state);
-                (bytes, true)
-            }
-            PosAction::Passthrough => (Vec::new(), false),
+        // Event-driven: emit a new POS section only when Roon's (length,
+        // seek, state) tuple has changed since we last emitted. HQPlayer's
+        // own POS bytes are always stripped so its length=0 / drifting
+        // counter never reach T8. Between events, T8 holds the last POS
+        // section we sent.
+        let pos_key = match (meta.length_seconds, meta.seek_position, meta.play_state) {
+            (Some(len), Some(seek), Some(state)) => Some((len, seek.max(0.0) as u32, state)),
+            _ => None,
         };
+        let pos_bytes: Option<Vec<u8>> = match pos_key {
+            Some(key) if Some(key) != self.last_pos_key => {
+                let (len, seek_int, state) = key;
+                let bytes = build_pos_section(
+                    len,
+                    meta.seek_position.unwrap(),
+                    state,
+                    1,
+                    meta.tracks_total.max(1),
+                );
+                eprintln!(
+                    "{} [POS] emit len={} seek={} state={:?}",
+                    ts(), len, seek_int, state,
+                );
+                self.last_pos_key = Some(key);
+                Some(bytes)
+            }
+            _ => None,
+        };
+
+        // Always clear HQP's POS bits from the outgoing header; either we're
+        // replacing them with ours, or we're leaving the slot empty so T8
+        // keeps displaying whatever it last saw.
+        header.type_mask &= !TYPE_POS;
+        header.pos_len = 0;
+        if let Some(ref b) = pos_bytes {
+            header.type_mask |= TYPE_POS;
+            header.pos_len = b.len() as u32;
+        }
 
         // --- Build op sequence ---
         // Body layout: [pcm][pos][meta][pic]
-        if replace_pos {
-            self.ops.push_back(FrameOp::Pass(pcm_bytes));
-            if orig_pos_len > 0 {
-                self.ops.push_back(FrameOp::Skip(orig_pos_len));
-            }
-            self.ops.push_back(FrameOp::Emit(pos_bytes));
-        } else {
-            // Coalesce PCM and pass-through POS into a single Pass.
-            self.ops.push_back(FrameOp::Pass(pcm_bytes + orig_pos_len));
+        self.ops.push_back(FrameOp::Pass(pcm_bytes));
+        if orig_pos_len > 0 {
+            self.ops.push_back(FrameOp::Skip(orig_pos_len));
+        }
+        if let Some(b) = pos_bytes {
+            self.ops.push_back(FrameOp::Emit(b));
         }
 
         // Meta/pic region

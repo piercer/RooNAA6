@@ -1,5 +1,4 @@
-use crate::metadata::{PlayState, PlaybackPosition};
-use std::time::Instant;
+use crate::metadata::PlayState;
 
 pub const FRAME_HEADER_SIZE: usize = 32;
 // type_mask bits — verified against HQPlayer's own emission (capture_proxy.py,
@@ -146,21 +145,20 @@ pub fn is_corrupt(header: &FrameHeader) -> bool {
 /// Format: `[position]\n` + `key=value\n` lines + `\0`.
 /// 16 fields in HQPlayer's emitted order — unknown or reordered fields
 /// cause the T8's whitelist parser to reject the whole section.
-#[allow(dead_code)]
-pub fn build_pos_section(pos: &PlaybackPosition, now: Instant) -> Vec<u8> {
+pub fn build_pos_section(
+    length_seconds: u32,
+    seek_position: f64,
+    state: PlayState,
+    track: u32,
+    tracks_total: u32,
+) -> Vec<u8> {
     use std::io::Write;
 
-    let elapsed = if matches!(pos.state, PlayState::Playing) {
-        now.saturating_duration_since(pos.captured_at).as_secs_f64()
-    } else {
-        0.0
-    };
-    let length_f = f64::from(pos.length_seconds);
-    let effective_pos = (pos.position_seconds + elapsed).clamp(0.0, length_f);
+    let length_f = f64::from(length_seconds);
+    let effective_pos = seek_position.clamp(0.0, length_f);
 
-    let total_secs = pos.length_seconds;
-    let total_min = total_secs / 60;
-    let total_sec = total_secs % 60;
+    let total_min = length_seconds / 60;
+    let total_sec = length_seconds % 60;
 
     let remain = (length_f - effective_pos).max(0.0) as u32;
     let remain_min = remain / 60;
@@ -170,7 +168,7 @@ pub fn build_pos_section(pos: &PlaybackPosition, now: Instant) -> Vec<u8> {
     let begin_min = begin / 60;
     let begin_sec = begin % 60;
 
-    let state_str = match pos.state {
+    let state_str = match state {
         PlayState::Playing => "PLAYING",
         PlayState::Paused => "PAUSED",
     };
@@ -195,8 +193,6 @@ pub fn build_pos_section(pos: &PlaybackPosition, now: Instant) -> Vec<u8> {
          total_sec={total_sec}\n\
          track={track}\n\
          tracks_total={tracks_total}\n",
-        track = pos.track,
-        tracks_total = pos.tracks_total,
     )
     .unwrap();
     section.push(0x00);

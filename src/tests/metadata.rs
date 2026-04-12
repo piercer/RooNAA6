@@ -1,43 +1,47 @@
-use std::time::Instant;
-
-use crate::metadata::{Metadata, PlayState, PlaybackPosition, SharedMetadata};
+use crate::metadata::{Metadata, PlayState, SharedMetadata};
 
 #[test]
-fn metadata_default_has_no_position() {
+fn metadata_default_is_empty() {
     let m = Metadata::default();
-    assert!(m.position.is_none());
+    assert!(m.length_seconds.is_none());
+    assert!(m.seek_position.is_none());
+    assert!(m.play_state.is_none());
     assert_eq!(m.title, "");
 }
 
 #[test]
-fn playback_position_fields() {
-    let now = Instant::now();
-    let p = PlaybackPosition {
-        length_seconds: 225,
-        position_seconds: 11.5,
-        captured_at: now,
-        state: PlayState::Playing,
-        track: 2,
-        tracks_total: 19,
-    };
-    assert_eq!(p.length_seconds, 225);
-    assert_eq!(p.state, PlayState::Playing);
-    assert_ne!(p.state, PlayState::Paused);
-}
-
-#[test]
-fn shared_metadata_carries_position() {
+fn shared_metadata_round_trip() {
     let shared = SharedMetadata::new();
     let mut m = shared.get();
     m.title = "Song".into();
-    m.position = Some(PlaybackPosition {
-        length_seconds: 100,
-        position_seconds: 0.0,
-        captured_at: Instant::now(),
-        state: PlayState::Paused,
-        track: 1,
-        tracks_total: 1,
-    });
+    m.length_seconds = Some(100);
+    m.seek_position = Some(0.0);
+    m.play_state = Some(PlayState::Paused);
     shared.set(m);
-    assert_eq!(shared.get().position.unwrap().state, PlayState::Paused);
+
+    let out = shared.get();
+    assert_eq!(out.title, "Song");
+    assert_eq!(out.length_seconds, Some(100));
+    assert_eq!(out.play_state, Some(PlayState::Paused));
+}
+
+#[test]
+fn shared_metadata_partial_update_preserves_other_fields() {
+    let shared = SharedMetadata::new();
+    shared.set(Metadata {
+        title: "Song".into(),
+        length_seconds: Some(225),
+        seek_position: Some(10.0),
+        play_state: Some(PlayState::Playing),
+        ..Metadata::default()
+    });
+
+    let mut m = shared.get();
+    m.seek_position = Some(11.0);
+    shared.set(m);
+
+    let out = shared.get();
+    assert_eq!(out.seek_position, Some(11.0));
+    assert_eq!(out.title, "Song");
+    assert_eq!(out.length_seconds, Some(225));
 }

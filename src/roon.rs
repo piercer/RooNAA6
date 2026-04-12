@@ -7,7 +7,7 @@ use serde_json::Value;
 use tungstenite::{Message, WebSocket};
 
 use crate::config::RoonConfig;
-use crate::metadata::{Metadata, PlaybackPosition, SharedMetadata};
+use crate::metadata::{PlayState, SharedMetadata};
 use crate::ts;
 
 pub fn run(shared: SharedMetadata, cfg: &RoonConfig) {
@@ -138,68 +138,14 @@ fn run_once(
                 if json_str(zone, "display_name") != Some(cfg.zone.as_str()) {
                     continue;
                 }
-                if let Some(np) = zone.get("now_playing") {
-                    let (title, artist, album) = extract_track_info(np);
-                    let image_key = json_str(np, "image_key").unwrap_or("").to_string();
-
-                    let mut cover_art = shared.get().cover_art;
-                    if !image_key.is_empty() && image_key != last_image_key {
-                        last_image_key = image_key.clone();
-                        cover_art =
-                            download_cover(&http_agent, &cfg.host, cfg.port, &image_key)
-                                .map(Arc::new);
-                    }
-
-                    eprintln!(
-                        "{} [roon] {} \u{2014} {} ({})",
-                        ts(), artist, title, album,
-                    );
-
-                    let extracted =
-                        extract_playback_position(zone, std::time::Instant::now());
-                    let prior = shared.get();
-                    let same_track = prior.title == title
-                        && prior.artist == artist
-                        && prior.album == album;
-
-                    let position = match extracted {
-                        None => None,
-                        Some((new_pos, true)) => Some(new_pos),
-                        Some((new_pos, false)) => {
-                            // now_playing carried no seek_position — this is a
-                            // mid-playback zones_changed refresh (queue edits,
-                            // image updates, etc.). Don't wipe position_seconds
-                            // if we already have a value for the same track;
-                            // just update the fields that might have changed.
-                            match (same_track, prior.position.as_ref()) {
-                                (true, Some(p)) => Some(PlaybackPosition {
-                                    length_seconds: new_pos.length_seconds,
-                                    position_seconds: p.position_seconds,
-                                    captured_at: p.captured_at,
-                                    state: new_pos.state,
-                                    track: new_pos.track,
-                                    tracks_total: new_pos.tracks_total,
-                                }),
-                                _ => Some(new_pos),
-                            }
-                        }
-                    };
-
-                    eprintln!(
-                        "{} [roon] position: {:?} (same_track={})",
-                        ts(),
-                        position,
-                        same_track,
-                    );
-
-                    shared.set(Metadata {
-                        title,
-                        artist,
-                        album,
-                        cover_art,
-                        position,
-                    });
-                }
+                apply_zone_update(
+                    shared,
+                    zone,
+                    &http_agent,
+                    &cfg.host,
+                    cfg.port,
+                    &mut last_image_key,
+                );
             }
         }
 
@@ -207,87 +153,98 @@ fn run_once(
     }
 }
 
-// --- Track info extraction ---
-
-/// Parse state / seek_position / now_playing.length from a zone object.
-///
-/// Returns `(position, seek_present)`. `seek_present=false` signals that
-/// `now_playing.seek_position` was missing and `position_seconds` was
-/// bootstrapped to 0.0 — the handler uses this to merge-preserve any prior
-/// position that `apply_zones_seek` had already patched in.
-pub(crate) fn extract_playback_position(
+/// Apply a full zone object to shared metadata. Does partial updates —
+/// each field is only touched if present on the zone body, so other
+/// events (zones_seek_changed, previous zones_changed) are never wiped.
+pub(crate) fn apply_zone_update(
+    shared: &SharedMetadata,
     zone: &Value,
-    captured_at: std::time::Instant,
-) -> Option<(crate::metadata::PlaybackPosition, bool)> {
-    use crate::metadata::{PlayState, PlaybackPosition};
+    http_agent: &ureq::Agent,
+    host: &str,
+    port: u16,
+    last_image_key: &mut String,
+) {
+    let mut meta = shared.get();
 
-    let state_str = zone.get("state").and_then(|v| v.as_str())?;
-    let state = match state_str {
-        "playing" | "loading" => PlayState::Playing,
-        "paused" => PlayState::Paused,
-        _ => return None, // "stopped" and anything unknown
-    };
+    if let Some(np) = zone.get("now_playing") {
+        let (title, artist, album) = extract_track_info(np);
+        meta.title = title;
+        meta.artist = artist;
+        meta.album = album;
 
-    let np = zone.get("now_playing")?;
-    let seek_raw = np
-        .get("seek_position")
-        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)));
-    let seek_present = seek_raw.is_some();
-    let seek_position = seek_raw.unwrap_or(0.0);
+        if let Some(image_key) = json_str(np, "image_key") {
+            if !image_key.is_empty() && image_key != *last_image_key {
+                *last_image_key = image_key.to_string();
+                meta.cover_art = download_cover(http_agent, host, port, image_key).map(Arc::new);
+            }
+        }
 
-    let length = np
-        .get("length")
-        .and_then(|v| v.as_u64())
-        .or_else(|| np.get("length").and_then(|v| v.as_i64()).map(|i| i.max(0) as u64))?
-        as u32;
-
-    let tracks_total = zone
-        .get("queue_items_remaining")
-        .and_then(|v| v.as_u64())
-        .map(|r| (r as u32) + 1)
-        .unwrap_or(1);
-    let track = 1;
-
-    Some((
-        PlaybackPosition {
-            length_seconds: length,
-            position_seconds: seek_position,
-            captured_at,
-            state,
-            track,
-            tracks_total,
-        },
-        seek_present,
-    ))
-}
-
-/// Apply a `zones_seek_changed` body to the shared metadata. Updates only
-/// position_seconds and captured_at on an existing PlaybackPosition —
-/// title/artist/album and length are untouched. No-op if there's no prior
-/// PlaybackPosition (we need length to build one).
-pub(crate) fn apply_zones_seek(shared: &SharedMetadata, body: &Value) {
-    let seeks = match body.get("zones_seek_changed").and_then(|v| v.as_array()) {
-        Some(s) => s,
-        None => return,
-    };
-    if seeks.is_empty() {
-        return;
+        if let Some(l) = np
+            .get("length")
+            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+        {
+            meta.length_seconds = Some(l as u32);
+        }
     }
 
-    let mut meta = shared.get();
-    let Some(mut pos) = meta.position else { return };
+    if let Some(state_str) = zone.get("state").and_then(|v| v.as_str()) {
+        meta.play_state = match state_str {
+            "playing" | "loading" => Some(PlayState::Playing),
+            "paused" => Some(PlayState::Paused),
+            _ => None, // stopped / unknown
+        };
+    }
 
-    let entry = &seeks[0];
+    // seek_position is a zone-level field in the Roon Transport API; check
+    // now_playing as a fallback defensively.
+    let seek = zone
+        .get("seek_position")
+        .or_else(|| zone.get("now_playing").and_then(|np| np.get("seek_position")))
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)));
+    if let Some(s) = seek {
+        meta.seek_position = Some(s);
+    }
+
+    if let Some(r) = zone.get("queue_items_remaining").and_then(|v| v.as_u64()) {
+        meta.tracks_total = (r as u32) + 1;
+    } else if meta.tracks_total == 0 {
+        meta.tracks_total = 1;
+    }
+    if meta.track == 0 {
+        meta.track = 1;
+    }
+
+    eprintln!(
+        "{} [roon] {} \u{2014} {} ({}) len={:?} seek={:?} state={:?}",
+        ts(),
+        meta.artist,
+        meta.title,
+        meta.album,
+        meta.length_seconds,
+        meta.seek_position,
+        meta.play_state,
+    );
+
+    shared.set(meta);
+}
+
+/// Apply a `zones_seek_changed` body: update only `seek_position` on the
+/// shared metadata. No-op if the body has no entries or the entry lacks a
+/// seek_position field.
+pub(crate) fn apply_zones_seek(shared: &SharedMetadata, body: &Value) {
+    let Some(seeks) = body.get("zones_seek_changed").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let Some(entry) = seeks.first() else { return };
     let Some(seek) = entry
         .get("seek_position")
         .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
     else {
         return;
     };
-    pos.position_seconds = seek;
-    pos.captured_at = std::time::Instant::now();
-    eprintln!("{} [roon] zones_seek: {}s", ts(), seek);
-    meta.position = Some(pos);
+
+    let mut meta = shared.get();
+    meta.seek_position = Some(seek);
     shared.set(meta);
 }
 

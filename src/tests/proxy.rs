@@ -1,9 +1,8 @@
 use std::sync::Arc;
-use std::time::Instant;
 
-use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC};
-use crate::metadata::{Metadata, PlayState, PlaybackPosition, SharedMetadata};
-use crate::proxy::{Action, FrameOp, FrameProcessor, PosAction};
+use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC, TYPE_POS};
+use crate::metadata::{Metadata, PlayState, SharedMetadata};
+use crate::proxy::{Action, FrameOp, FrameProcessor};
 
 const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
 const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
@@ -18,7 +17,11 @@ fn meta(title: &str, artist: &str, album: &str, cover: Option<&[u8]>) -> Metadat
         artist: artist.to_string(),
         album: album.to_string(),
         cover_art: cover.map(|c| Arc::new(c.to_vec())),
-        position: None,
+        length_seconds: None,
+        seek_position: None,
+        play_state: None,
+        track: 0,
+        tracks_total: 0,
     }
 }
 
@@ -33,7 +36,7 @@ fn new_defaults() {
     assert_eq!(proc.frame_count, 0);
     assert!(!proc.injected);
     assert!(proc.last_title.is_none());
-    assert!(proc.last_pos_state.is_none());
+    assert!(proc.last_pos_key.is_none());
     assert!(proc.pending_meta_pic.is_none());
     assert!(!proc.strip_logged);
     assert_eq!(proc.params.bits, 32);
@@ -45,11 +48,11 @@ fn reset_clears_state() {
     let mut proc = new_processor();
     proc.injected = true;
     proc.last_title = Some("Old Song".into());
-    proc.last_pos_state = Some(crate::metadata::PlayState::Playing);
+    proc.last_pos_key = Some((225, 10, PlayState::Playing));
     proc.frame_count = 500;
     proc.strip_logged = true;
     proc.pending_meta_pic = Some(vec![1, 2, 3]);
-    proc.ops.push_back(crate::proxy::FrameOp::Pass(100));
+    proc.ops.push_back(FrameOp::Pass(100));
     proc.header_buf.extend_from_slice(&[0u8; 16]);
 
     proc.reset_for_start(DSD);
@@ -57,7 +60,7 @@ fn reset_clears_state() {
     assert!(proc.ops.is_empty());
     assert!(!proc.injected);
     assert!(proc.last_title.is_none());
-    assert!(proc.last_pos_state.is_none());
+    assert!(proc.last_pos_key.is_none());
     assert_eq!(proc.frame_count, 0);
     assert!(!proc.strip_logged);
     assert!(proc.header_buf.is_empty());
@@ -250,86 +253,26 @@ fn strip_preserves_other_type_bits() {
     let mut h = header(0x1D, 100, 50, 300, 5000);
     proc.strip(&mut h);
 
+    // strip() only clears META|PIC; POS bit is left to build_frame_ops.
     // After strip: PCM(0x01) | POS(0x04) = 0x05
     assert_eq!(h.type_mask, 0x05);
 }
 
-fn pos_now(state: PlayState) -> PlaybackPosition {
-    PlaybackPosition {
-        length_seconds: 225,
-        position_seconds: 10.0,
-        captured_at: Instant::now(),
-        state,
-        track: 1,
-        tracks_total: 10,
-    }
-}
+// --- build_frame_ops: event-driven POS injection ---
 
-#[test]
-fn decide_pos_passthrough_when_no_position() {
-    let proc = new_processor();
-    assert_eq!(proc.decide_pos_action(None), PosAction::Passthrough);
-}
-
-#[test]
-fn decide_pos_passthrough_when_no_position_data() {
-    let proc = new_processor();
-    assert_eq!(proc.decide_pos_action(None), PosAction::Passthrough);
-}
-
-#[test]
-fn decide_pos_inject_on_first_sight() {
-    let mut proc = new_processor();
-    proc.frame_count = 1;
-    let p = pos_now(PlayState::Playing);
-    assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Inject);
-}
-
-#[test]
-fn decide_pos_inject_on_state_transition() {
-    let mut proc = new_processor();
-    proc.frame_count = 7;
-    proc.last_pos_state = Some(PlayState::Playing);
-    let p = pos_now(PlayState::Paused);
-    assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Inject);
-}
-
-#[test]
-fn decide_pos_inject_on_cadence_tick() {
-    // HQPlayer emits POS every ~10 frames; we match.
-    let mut proc = new_processor();
-    proc.frame_count = 10;
-    proc.last_pos_state = Some(PlayState::Playing);
-    let p = pos_now(PlayState::Playing);
-    assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Inject);
-}
-
-#[test]
-fn decide_pos_passthrough_between_cadence_ticks() {
-    let mut proc = new_processor();
-    proc.frame_count = 7;
-    proc.last_pos_state = Some(PlayState::Playing);
-    let p = pos_now(PlayState::Playing);
-    assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Passthrough);
-}
-
-fn set_position(shared: &SharedMetadata, state: PlayState) {
+fn set_position(shared: &SharedMetadata, length: u32, seek: f64, state: PlayState) {
     let mut m = shared.get();
-    m.position = Some(PlaybackPosition {
-        length_seconds: 225,
-        position_seconds: 10.0,
-        captured_at: Instant::now(),
-        state,
-        track: 1,
-        tracks_total: 5,
-    });
+    m.length_seconds = Some(length);
+    m.seek_position = Some(seek);
+    m.play_state = Some(state);
+    m.tracks_total = 5;
     shared.set(m);
 }
 
 fn body_header(pcm_len: u32, pos_len: u32) -> FrameHeader {
     FrameHeader {
-        raw: [0u8; crate::frame::FRAME_HEADER_SIZE],
-        type_mask: 0x11, // PCM | POS
+        raw: [0u8; FRAME_HEADER_SIZE],
+        type_mask: 0x01 | TYPE_POS, // PCM | POS
         pcm_len,
         pos_len,
         meta_len: 0,
@@ -338,9 +281,9 @@ fn body_header(pcm_len: u32, pos_len: u32) -> FrameHeader {
 }
 
 #[test]
-fn build_frame_ops_injects_pos_on_first_sight() {
+fn build_frame_ops_emits_pos_on_first_sight() {
     let shared = SharedMetadata::new();
-    set_position(&shared, PlayState::Playing);
+    set_position(&shared, 225, 10.0, PlayState::Playing);
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
     proc.frame_count = 1;
@@ -362,11 +305,15 @@ fn build_frame_ops_injects_pos_on_first_sight() {
         "third op should emit new pos body, got {ops:?}"
     );
     assert!(header.pos_len > 0);
-    assert_eq!(proc.last_pos_state, Some(PlayState::Playing));
+    assert_ne!(header.type_mask & TYPE_POS, 0);
+    assert_eq!(proc.last_pos_key, Some((225, 10, PlayState::Playing)));
 }
 
 #[test]
-fn build_frame_ops_passes_pos_when_no_position_in_shared() {
+fn build_frame_ops_strips_hqp_pos_when_no_shared_position() {
+    // HQPlayer sends POS bytes but Roon hasn't populated position yet.
+    // We must strip HQP's POS (which contains length=0 / garbage) rather
+    // than passing it through.
     let shared = SharedMetadata::new();
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
@@ -377,38 +324,52 @@ fn build_frame_ops_passes_pos_when_no_position_in_shared() {
 
     let ops: Vec<_> = proc.ops.iter().collect();
     assert!(
-        matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4 + 50),
-        "first op should pass pcm+pos, got {ops:?}"
+        matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4),
+        "first op should pass PCM bytes only, got {ops:?}"
     );
-    assert!(proc.last_pos_state.is_none());
-    assert_eq!(header.pos_len, 50);
+    assert!(
+        matches!(ops[1], FrameOp::Skip(50)),
+        "second op should skip orig pos bytes, got {ops:?}"
+    );
+    assert!(proc.last_pos_key.is_none());
+    assert_eq!(header.pos_len, 0);
+    assert_eq!(header.type_mask & TYPE_POS, 0);
 }
 
 #[test]
-fn build_frame_ops_passes_pos_mid_cadence() {
+fn build_frame_ops_skips_hqp_pos_when_key_unchanged() {
+    // Once last_pos_key matches shared state, we stop emitting new POS
+    // sections but still strip HQP's stale bytes every frame.
     let shared = SharedMetadata::new();
-    set_position(&shared, PlayState::Playing);
+    set_position(&shared, 225, 10.0, PlayState::Playing);
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
     proc.frame_count = 7;
-    proc.last_pos_state = Some(PlayState::Playing);
+    proc.last_pos_key = Some((225, 10, PlayState::Playing));
 
     let mut header = body_header(100, 50);
     proc.build_frame_ops(&mut header);
 
     let ops: Vec<_> = proc.ops.iter().collect();
-    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4 + 50));
-    assert_eq!(header.pos_len, 50);
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Skip(50)));
+    assert_eq!(
+        ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count(),
+        0,
+        "should not emit a new POS section when key is unchanged, got {ops:?}"
+    );
+    assert_eq!(header.pos_len, 0);
+    assert_eq!(header.type_mask & TYPE_POS, 0);
 }
 
 #[test]
-fn build_frame_ops_injects_pos_on_state_change() {
+fn build_frame_ops_emits_pos_on_state_change() {
     let shared = SharedMetadata::new();
-    set_position(&shared, PlayState::Paused);
+    set_position(&shared, 225, 10.0, PlayState::Paused);
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
     proc.frame_count = 7;
-    proc.last_pos_state = Some(PlayState::Playing);
+    proc.last_pos_key = Some((225, 10, PlayState::Playing));
 
     let mut header = body_header(100, 50);
     proc.build_frame_ops(&mut header);
@@ -417,13 +378,32 @@ fn build_frame_ops_injects_pos_on_state_change() {
     assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
     assert!(matches!(ops[1], FrameOp::Skip(50)));
     assert!(matches!(ops[2], FrameOp::Emit(_)));
-    assert_eq!(proc.last_pos_state, Some(PlayState::Paused));
+    assert_eq!(proc.last_pos_key, Some((225, 10, PlayState::Paused)));
+}
+
+#[test]
+fn build_frame_ops_emits_pos_on_seek_change() {
+    let shared = SharedMetadata::new();
+    set_position(&shared, 225, 42.0, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.frame_count = 50;
+    proc.last_pos_key = Some((225, 10, PlayState::Playing));
+
+    let mut header = body_header(100, 50);
+    proc.build_frame_ops(&mut header);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(_)));
+    assert!(matches!(ops[1], FrameOp::Skip(50)));
+    assert!(matches!(ops[2], FrameOp::Emit(_)));
+    assert_eq!(proc.last_pos_key, Some((225, 42, PlayState::Playing)));
 }
 
 #[test]
 fn build_frame_ops_pos_with_no_orig_pos_section() {
     let shared = SharedMetadata::new();
-    set_position(&shared, PlayState::Playing);
+    set_position(&shared, 225, 10.0, PlayState::Playing);
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
     proc.frame_count = 1;
