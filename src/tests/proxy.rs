@@ -17,6 +17,7 @@ fn meta(title: &str, artist: &str, album: &str, cover: Option<&[u8]>) -> Metadat
         artist: artist.to_string(),
         album: album.to_string(),
         cover_art: cover.map(|c| Arc::new(c.to_vec())),
+        position: None,
     }
 }
 

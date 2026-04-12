@@ -160,6 +160,7 @@ fn run_once(
                         artist,
                         album,
                         cover_art,
+                        position: None,
                     });
                 }
             }

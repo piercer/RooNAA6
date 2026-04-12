@@ -1,4 +1,21 @@
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayState {
+    Playing,
+    Paused,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PlaybackPosition {
+    pub length_seconds: u32,
+    pub position_seconds: f64,
+    pub captured_at: Instant,
+    pub state: PlayState,
+    pub track: u32,
+    pub tracks_total: u32,
+}
 
 #[derive(Clone, Default)]
 pub struct Metadata {
@@ -6,6 +23,7 @@ pub struct Metadata {
     pub artist: String,
     pub album: String,
     pub cover_art: Option<Arc<Vec<u8>>>,
+    pub position: Option<PlaybackPosition>,
 }
 
 /// Thread-safe shared metadata, read-optimised via RwLock.
