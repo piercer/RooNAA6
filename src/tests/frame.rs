@@ -22,7 +22,7 @@ fn parse_header_pcm() {
 
     let h = parse_header(&buf).unwrap();
     assert_eq!(h, header(0x1D, 81920, 271, 100, 5000));
-    assert!(h.has_meta());
+    assert_ne!(h.type_mask & crate::frame::TYPE_META, 0);
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn parse_header_dsd() {
     let h = parse_header(&buf).unwrap();
     assert_eq!(h.type_mask, 0x11);
     assert_eq!(h.pcm_len, 602112);
-    assert!(!h.has_meta());
+    assert_eq!(h.type_mask & crate::frame::TYPE_META, 0);
 }
 
 #[test]

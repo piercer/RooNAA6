@@ -29,12 +29,6 @@ impl PartialEq for FrameHeader {
     }
 }
 
-impl FrameHeader {
-    pub fn has_meta(&self) -> bool {
-        self.type_mask & TYPE_META != 0
-    }
-}
-
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub struct StreamParams {
     pub bits: u32,

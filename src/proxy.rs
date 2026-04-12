@@ -6,7 +6,7 @@ use crate::frame::{
     build_meta_section, is_corrupt, parse_header, parse_start_message, serialize_header,
     FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC, TYPE_POS,
 };
-use crate::metadata::{Metadata, SharedMetadata};
+use crate::metadata::SharedMetadata;
 use crate::ts;
 
 #[derive(Debug, PartialEq)]
@@ -86,28 +86,16 @@ pub fn forward_passthrough(mut src: TcpStream, mut dst: TcpStream, label: &str) 
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub(crate) enum Action {
-    Inject,
-    Gapless,
-    Strip,
-    Refresh,
-    Passthrough,
-}
-
 pub(crate) struct FrameProcessor {
     pub(crate) shared: SharedMetadata,
     pub(crate) params: StreamParams,
     pub(crate) ops: VecDeque<FrameOp>,
     pub(crate) header_buf: Vec<u8>,
-    pub(crate) injected: bool,
-    pub(crate) last_title: Option<String>,
+    /// (title, artist, album) last emitted as META/PIC.
+    pub(crate) last_meta_key: Option<(String, String, String)>,
     /// (length, seek rounded to integer seconds, state) last emitted as POS.
-    /// Used to decide whether the current frame needs a fresh POS section.
     pub(crate) last_pos_key: Option<(u32, u32, crate::metadata::PlayState)>,
     pub(crate) frame_count: u64,
-    pub(crate) strip_logged: bool,
-    pub(crate) pending_meta_pic: Option<Vec<u8>>,
 }
 
 impl FrameProcessor {
@@ -122,85 +110,29 @@ impl FrameProcessor {
             },
             ops: VecDeque::new(),
             header_buf: Vec::with_capacity(FRAME_HEADER_SIZE),
-            injected: false,
-            last_title: None,
+            last_meta_key: None,
             last_pos_key: None,
             frame_count: 0,
-            strip_logged: false,
-            pending_meta_pic: None,
         }
     }
 
     pub(crate) fn reset_for_start(&mut self, params: StreamParams) {
         self.params = params;
-        self.injected = false;
-        self.last_title = None;
+        self.last_meta_key = None;
         self.last_pos_key = None;
         self.frame_count = 0;
-        self.strip_logged = false;
         self.header_buf.clear();
         self.ops.clear();
-        self.pending_meta_pic = None;
-    }
-
-    /// Build and set the injection payload. Returns JPEG size for logging.
-    pub(crate) fn inject(&mut self, header: &mut FrameHeader, meta: &Metadata, with_cover: bool) -> usize {
-        let meta_section =
-            build_meta_section(&self.params, &meta.title, &meta.artist, &meta.album);
-        header.type_mask |= TYPE_META;
-        header.meta_len = meta_section.len() as u32;
-
-        let mut payload = meta_section;
-        let mut jpeg_len = 0;
-        if with_cover {
-            if let Some(jpeg) = &meta.cover_art {
-                jpeg_len = jpeg.len();
-                header.type_mask |= TYPE_PIC;
-                header.pic_len = jpeg_len as u32;
-                payload.extend_from_slice(jpeg);
-            }
-        }
-        self.pending_meta_pic = Some(payload);
-        self.last_title = Some(meta.title.clone());
-        jpeg_len
-    }
-
-    pub(crate) fn strip(&mut self, header: &mut FrameHeader) {
-        header.type_mask &= !(TYPE_META | TYPE_PIC);
-        header.meta_len = 0;
-        header.pic_len = 0;
-        self.pending_meta_pic = None;
-    }
-
-    /// Pure decision function: given frame has_meta bit and current Roon title,
-    /// decide what to do with this frame. No side effects.
-    pub(crate) fn decide_action(&self, has_meta: bool, title: &str) -> Action {
-        if !title.is_empty() && !self.injected {
-            // First injection — trigger on any frame once Roon title is known.
-            // We don't wait for HQPlayer's META frame because it may have
-            // already been stripped (see next branch).
-            Action::Inject
-        } else if has_meta && !self.injected {
-            // HQPlayer sent META before Roon metadata arrived.
-            // Strip it so T8 doesn't show HQP's fallback title ("Roon").
-            Action::Strip
-        } else if !title.is_empty()
-            && self.injected
-            && self.last_title.as_deref() != Some(title)
-        {
-            Action::Gapless
-        } else if has_meta && self.injected {
-            Action::Strip
-        } else if self.injected && !title.is_empty() && self.frame_count % 300 == 0 {
-            Action::Refresh
-        } else {
-            Action::Passthrough
-        }
     }
 
     /// Build the op sequence for one frame's body (everything after the header).
-    /// Mutates `header` to reflect final meta_len/pic_len values.
+    /// Mutates `header` to reflect final section lengths and type_mask bits.
     /// The header serialisation itself is pushed by the caller.
+    ///
+    /// Uniform rule for every section the proxy owns (POS, META, PIC):
+    ///   1. Unconditionally strip HQPlayer's bytes from the outgoing header.
+    ///   2. Emit a replacement only when Roon's value has changed since the
+    ///      last one we sent. Between events the T8 holds the last section.
     pub(crate) fn build_frame_ops(&mut self, header: &mut FrameHeader) {
         use crate::frame::build_pos_section;
 
@@ -208,59 +140,10 @@ impl FrameProcessor {
         let orig_pos_len = header.pos_len as usize;
         let orig_meta_len = header.meta_len as usize;
         let orig_pic_len = header.pic_len as usize;
-        let has_meta = header.has_meta();
 
         let meta = self.shared.get();
-        let title = meta.title.clone();
 
-        // --- Meta/pic decision (unchanged) ---
-        let action = self.decide_action(has_meta, &title);
-        let replace_meta_pic = match action {
-            Action::Inject => {
-                let jpeg_len = self.inject(header, &meta, true);
-                self.injected = true;
-                eprintln!(
-                    "{} [INJECT] {} / {} / {} + {}b cover",
-                    ts(), title, meta.artist, meta.album, jpeg_len,
-                );
-                true
-            }
-            Action::Gapless => {
-                let jpeg_len = self.inject(header, &meta, true);
-                eprintln!(
-                    "{} [GAPLESS] {} / {} / {} + {}b cover",
-                    ts(), title, meta.artist, meta.album, jpeg_len,
-                );
-                true
-            }
-            Action::Strip => {
-                self.strip(header);
-                if !self.strip_logged {
-                    eprintln!(
-                        "{} [STRIP] META stripped (frame {}, injected={})",
-                        ts(), self.frame_count, self.injected,
-                    );
-                    self.strip_logged = true;
-                }
-                true
-            }
-            Action::Refresh => {
-                self.inject(header, &meta, false);
-                eprintln!(
-                    "{} [REFRESH] {} (frame {})",
-                    ts(), title, self.frame_count,
-                );
-                true
-            }
-            Action::Passthrough => false,
-        };
-
-        // --- POS decision ---
-        // Event-driven: emit a new POS section only when Roon's (length,
-        // seek, state) tuple has changed since we last emitted. HQPlayer's
-        // own POS bytes are always stripped so its length=0 / drifting
-        // counter never reach T8. Between events, T8 holds the last POS
-        // section we sent.
+        // --- POS: strip HQP, emit ours on change ---
         let pos_key = match (meta.length_seconds, meta.seek_position, meta.play_state) {
             (Some(len), Some(seek), Some(state)) => Some((len, seek.max(0.0) as u32, state)),
             _ => None,
@@ -285,14 +168,51 @@ impl FrameProcessor {
             _ => None,
         };
 
-        // Always clear HQP's POS bits from the outgoing header; either we're
-        // replacing them with ours, or we're leaving the slot empty so T8
-        // keeps displaying whatever it last saw.
-        header.type_mask &= !TYPE_POS;
+        // --- META/PIC: strip HQP, emit ours on change ---
+        let meta_key: Option<(String, String, String)> = if meta.title.is_empty() {
+            None
+        } else {
+            Some((meta.title.clone(), meta.artist.clone(), meta.album.clone()))
+        };
+        let meta_bytes: Option<Vec<u8>> = match &meta_key {
+            Some(key) if self.last_meta_key.as_ref() != Some(key) => {
+                let mut payload =
+                    build_meta_section(&self.params, &meta.title, &meta.artist, &meta.album);
+                let jpeg_len = if let Some(jpeg) = &meta.cover_art {
+                    payload.extend_from_slice(jpeg);
+                    jpeg.len()
+                } else {
+                    0
+                };
+                eprintln!(
+                    "{} [META] {} / {} / {} + {}b cover",
+                    ts(), meta.title, meta.artist, meta.album, jpeg_len,
+                );
+                self.last_meta_key = Some(key.clone());
+                Some(payload)
+            }
+            _ => None,
+        };
+
+        // --- Rewrite header ---
+        // Always strip every section the proxy owns; set bits/lengths back
+        // only for the sections we're actually emitting this frame.
+        header.type_mask &= !(TYPE_POS | TYPE_META | TYPE_PIC);
         header.pos_len = 0;
+        header.meta_len = 0;
+        header.pic_len = 0;
         if let Some(ref b) = pos_bytes {
             header.type_mask |= TYPE_POS;
             header.pos_len = b.len() as u32;
+        }
+        if let Some(ref b) = meta_bytes {
+            header.type_mask |= TYPE_META;
+            let meta_section_len = b.len() - meta.cover_art.as_deref().map_or(0, |j| j.len());
+            header.meta_len = meta_section_len as u32;
+            if let Some(jpeg) = &meta.cover_art {
+                header.type_mask |= TYPE_PIC;
+                header.pic_len = jpeg.len() as u32;
+            }
         }
 
         // --- Build op sequence ---
@@ -304,20 +224,11 @@ impl FrameProcessor {
         if let Some(b) = pos_bytes {
             self.ops.push_back(FrameOp::Emit(b));
         }
-
-        // Meta/pic region
-        if replace_meta_pic {
-            if orig_meta_len + orig_pic_len > 0 {
-                self.ops.push_back(FrameOp::Skip(orig_meta_len + orig_pic_len));
-            }
-            if let Some(payload) = self.pending_meta_pic.take() {
-                self.ops.push_back(FrameOp::Emit(payload));
-            }
-        } else {
-            if orig_meta_len + orig_pic_len > 0 {
-                self.ops.push_back(FrameOp::Pass(orig_meta_len + orig_pic_len));
-            }
-            self.pending_meta_pic = None;
+        if orig_meta_len + orig_pic_len > 0 {
+            self.ops.push_back(FrameOp::Skip(orig_meta_len + orig_pic_len));
+        }
+        if let Some(b) = meta_bytes {
+            self.ops.push_back(FrameOp::Emit(b));
         }
     }
 }
