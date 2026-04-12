@@ -87,13 +87,6 @@ pub fn forward_passthrough(mut src: TcpStream, mut dst: TcpStream, label: &str) 
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum Phase {
-    Header,
-    Pass,
-    Skip,
-}
-
-#[derive(Debug, PartialEq)]
 pub(crate) enum Action {
     Inject,
     Gapless,
@@ -111,16 +104,14 @@ pub(crate) enum PosAction {
 pub(crate) struct FrameProcessor {
     pub(crate) shared: SharedMetadata,
     pub(crate) params: StreamParams,
-    pub(crate) phase: Phase,
-    pub(crate) pass_remaining: usize,
-    pub(crate) skip_remaining: usize,
-    pub(crate) pending_inject: Option<Vec<u8>>,
+    pub(crate) ops: VecDeque<FrameOp>,
     pub(crate) header_buf: Vec<u8>,
     pub(crate) injected: bool,
     pub(crate) last_title: Option<String>,
     pub(crate) last_pos_state: Option<crate::metadata::PlayState>,
     pub(crate) frame_count: u64,
     pub(crate) strip_logged: bool,
+    pub(crate) pending_meta_pic: Option<Vec<u8>>,
 }
 
 impl FrameProcessor {
@@ -133,31 +124,27 @@ impl FrameProcessor {
                 is_dsd: false,
                 bytes_per_sample: 4,
             },
-            phase: Phase::Header,
-            pass_remaining: 0,
-            skip_remaining: 0,
-            pending_inject: None,
+            ops: VecDeque::new(),
             header_buf: Vec::with_capacity(FRAME_HEADER_SIZE),
             injected: false,
             last_title: None,
             last_pos_state: None,
             frame_count: 0,
             strip_logged: false,
+            pending_meta_pic: None,
         }
     }
 
     pub(crate) fn reset_for_start(&mut self, params: StreamParams) {
         self.params = params;
-        self.phase = Phase::Header;
         self.injected = false;
         self.last_title = None;
         self.last_pos_state = None;
         self.frame_count = 0;
         self.strip_logged = false;
         self.header_buf.clear();
-        self.pass_remaining = 0;
-        self.skip_remaining = 0;
-        self.pending_inject = None;
+        self.ops.clear();
+        self.pending_meta_pic = None;
     }
 
     /// Build and set the injection payload. Returns JPEG size for logging.
@@ -177,7 +164,7 @@ impl FrameProcessor {
                 payload.extend_from_slice(jpeg);
             }
         }
-        self.pending_inject = Some(payload);
+        self.pending_meta_pic = Some(payload);
         self.last_title = Some(meta.title.clone());
         jpeg_len
     }
@@ -186,7 +173,7 @@ impl FrameProcessor {
         header.type_mask &= !(TYPE_META | TYPE_PIC);
         header.meta_len = 0;
         header.pic_len = 0;
-        self.pending_inject = None;
+        self.pending_meta_pic = None;
     }
 
     /// Pure decision function: given frame has_meta bit and current Roon title,
@@ -241,6 +228,78 @@ impl FrameProcessor {
 
         PosAction::Passthrough
     }
+
+    /// Build the op sequence for one frame's body (everything after the header).
+    /// Mutates `header` to reflect final meta_len/pic_len values.
+    /// The header serialisation itself is pushed by the caller.
+    pub(crate) fn build_frame_ops(&mut self, header: &mut FrameHeader) {
+        let pcm_bytes = header.pcm_len as usize * self.params.bytes_per_sample as usize;
+        let pos_bytes = header.pos_len as usize;
+        let orig_meta_len = header.meta_len as usize;
+        let orig_pic_len = header.pic_len as usize;
+        let has_meta = header.has_meta();
+
+        let meta = self.shared.get();
+        let title = meta.title.clone();
+
+        let action = self.decide_action(has_meta, &title);
+        let replace_meta_pic = match action {
+            Action::Inject => {
+                let jpeg_len = self.inject(header, &meta, true);
+                self.injected = true;
+                eprintln!(
+                    "{} [INJECT] {} / {} / {} + {}b cover",
+                    ts(), title, meta.artist, meta.album, jpeg_len,
+                );
+                true
+            }
+            Action::Gapless => {
+                let jpeg_len = self.inject(header, &meta, true);
+                eprintln!(
+                    "{} [GAPLESS] {} / {} / {} + {}b cover",
+                    ts(), title, meta.artist, meta.album, jpeg_len,
+                );
+                true
+            }
+            Action::Strip => {
+                self.strip(header);
+                if !self.strip_logged {
+                    eprintln!(
+                        "{} [STRIP] META stripped (frame {}, injected={})",
+                        ts(), self.frame_count, self.injected,
+                    );
+                    self.strip_logged = true;
+                }
+                true
+            }
+            Action::Refresh => {
+                self.inject(header, &meta, false);
+                eprintln!(
+                    "{} [REFRESH] {} (frame {})",
+                    ts(), title, self.frame_count,
+                );
+                true
+            }
+            Action::Passthrough => false,
+        };
+
+        // Body layout: [pcm][pos][meta][pic]
+        // Task 5 behaviour: POS is always passed through unchanged.
+        self.ops.push_back(FrameOp::Pass(pcm_bytes + pos_bytes));
+        if replace_meta_pic {
+            if orig_meta_len + orig_pic_len > 0 {
+                self.ops.push_back(FrameOp::Skip(orig_meta_len + orig_pic_len));
+            }
+            if let Some(payload) = self.pending_meta_pic.take() {
+                self.ops.push_back(FrameOp::Emit(payload));
+            }
+        } else {
+            if orig_meta_len + orig_pic_len > 0 {
+                self.ops.push_back(FrameOp::Pass(orig_meta_len + orig_pic_len));
+            }
+            self.pending_meta_pic = None;
+        }
+    }
 }
 
 /// Handle XML data: log it, check for start messages, reset state, forward to dst.
@@ -267,16 +326,10 @@ fn handle_xml(
 
 /// Forward HQP->NAA: frame-level processing with metadata injection.
 ///
-/// State machine processes NAA v6 binary frames, injecting Roon metadata
-/// and cover art into the audio stream so the DAC displays track info.
-///
-/// Actions (see FrameProcessor::decide_action):
-/// - INJECT: first frame once Roon title is known -- inject title/artist/album + cover
-/// - GAPLESS: track change during gapless playback -- inject new metadata + cover
-/// - STRIP: either HQPlayer META before Roon title (avoid "Roon" leaking to T8),
-///   or HQPlayer META refresh after we've already injected
-/// - REFRESH: periodic re-injection (~every 300 frames / ~30s) to prevent DAC revert
-/// - PASSTHROUGH: normal frames with no metadata work needed
+/// Processes NAA v6 binary frames, injecting Roon metadata and cover art
+/// into the audio stream so the DAC displays track info. See
+/// FrameProcessor::decide_action for the injection logic, and
+/// FrameProcessor::build_frame_ops for how each frame is shaped.
 pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: SharedMetadata) {
     let label = "HQP->NAA";
     let mut buf = [0u8; 65536];
@@ -297,8 +350,8 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
         };
         let data = &buf[..n];
 
-        // Top-of-buffer XML check (before binary frame processing)
-        if proc.phase == Phase::Header && proc.header_buf.is_empty() {
+        // Top-of-buffer XML check (before any frame processing)
+        if proc.ops.is_empty() && proc.header_buf.is_empty() {
             if let Some(idx) = data.iter().position(|&b| !b.is_ascii_whitespace()) {
                 if data[idx] == b'<' {
                     if let Err(e) = handle_xml(&mut proc, data, &mut dst, label) {
@@ -310,152 +363,65 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
             }
         }
 
-        // Binary frame processing
         let mut pos = 0;
         out.clear();
 
         while pos < data.len() {
-            match proc.phase {
-                Phase::Header => {
-                    // Mid-buffer XML check
-                    if proc.header_buf.is_empty() && data[pos] == b'<' {
-                        if !out.is_empty() {
-                            if let Err(e) = dst.write_all(&out) {
-                                eprintln!("{} [{}] write error: {}", ts(), label, e);
-                                return;
-                            }
-                            out.clear();
-                        }
-                        if let Err(e) = handle_xml(&mut proc, &data[pos..], &mut dst, label) {
+            // If we have no pending ops, we're accumulating a header.
+            if proc.ops.is_empty() {
+                // Mid-buffer XML check
+                if proc.header_buf.is_empty() && data[pos] == b'<' {
+                    if !out.is_empty() {
+                        if let Err(e) = dst.write_all(&out) {
                             eprintln!("{} [{}] write error: {}", ts(), label, e);
                             return;
                         }
-                        break; // rest of buffer is XML, already sent
+                        out.clear();
                     }
-
-                    // Accumulate header bytes (32 total)
-                    let need = FRAME_HEADER_SIZE - proc.header_buf.len();
-                    let take = need.min(data.len() - pos);
-                    proc.header_buf.extend_from_slice(&data[pos..pos + take]);
-                    pos += take;
-
-                    if proc.header_buf.len() < FRAME_HEADER_SIZE {
-                        continue;
-                    }
-
-                    let mut header = parse_header(&proc.header_buf)
-                        .expect("header_buf is FRAME_HEADER_SIZE");
-                    proc.header_buf.clear();
-
-                    if is_corrupt(&header) {
-                        eprintln!(
-                            "{} [CORRUPT] pcm_len={} pos_len={} meta_len={} pic_len={}, closing",
-                            ts(),
-                            header.pcm_len,
-                            header.pos_len,
-                            header.meta_len,
-                            header.pic_len,
-                        );
+                    if let Err(e) = handle_xml(&mut proc, &data[pos..], &mut dst, label) {
+                        eprintln!("{} [{}] write error: {}", ts(), label, e);
                         return;
                     }
-
-                    let pcm_bytes =
-                        header.pcm_len as usize * proc.params.bytes_per_sample as usize;
-                    let pos_bytes = header.pos_len as usize;
-                    let orig_meta_len = header.meta_len as usize;
-                    let orig_pic_len = header.pic_len as usize;
-                    let has_meta = header.has_meta();
-
-                    let meta = proc.shared.get();
-                    let title = &meta.title;
-                    proc.frame_count += 1;
-
-                    // Decide action; replace_original means we strip the original meta/pic
-                    let action = proc.decide_action(has_meta, title);
-                    let replace_original = match action {
-                        Action::Inject => {
-                            let jpeg_len = proc.inject(&mut header, &meta, true);
-                            proc.injected = true;
-                            eprintln!(
-                                "{} [INJECT] {} / {} / {} + {}b cover",
-                                ts(), title, meta.artist, meta.album, jpeg_len,
-                            );
-                            true
-                        }
-                        Action::Gapless => {
-                            let jpeg_len = proc.inject(&mut header, &meta, true);
-                            eprintln!(
-                                "{} [GAPLESS] {} / {} / {} + {}b cover",
-                                ts(), title, meta.artist, meta.album, jpeg_len,
-                            );
-                            true
-                        }
-                        Action::Strip => {
-                            proc.strip(&mut header);
-                            if !proc.strip_logged {
-                                eprintln!(
-                                    "{} [STRIP] META stripped (frame {}, injected={})",
-                                    ts(), proc.frame_count, proc.injected,
-                                );
-                                proc.strip_logged = true;
-                            }
-                            true
-                        }
-                        Action::Refresh => {
-                            proc.inject(&mut header, &meta, false);
-                            eprintln!(
-                                "{} [REFRESH] {} (frame {})",
-                                ts(), title, proc.frame_count,
-                            );
-                            true
-                        }
-                        Action::Passthrough => {
-                            proc.pending_inject = None;
-                            false
-                        }
-                    };
-
-                    if replace_original {
-                        proc.pass_remaining = pcm_bytes + pos_bytes;
-                        proc.skip_remaining = orig_meta_len + orig_pic_len;
-                    } else {
-                        proc.pass_remaining =
-                            pcm_bytes + pos_bytes + orig_meta_len + orig_pic_len;
-                        proc.skip_remaining = 0;
-                    }
-
-                    out.extend_from_slice(&serialize_header(&header));
-                    proc.phase = Phase::Pass;
+                    break; // rest of buffer handled by XML path
                 }
 
-                Phase::Pass => {
-                    let take = proc.pass_remaining.min(data.len() - pos);
-                    out.extend_from_slice(&data[pos..pos + take]);
-                    pos += take;
-                    proc.pass_remaining -= take;
+                // Accumulate header bytes (32 total)
+                let need = FRAME_HEADER_SIZE - proc.header_buf.len();
+                let take = need.min(data.len() - pos);
+                proc.header_buf.extend_from_slice(&data[pos..pos + take]);
+                pos += take;
 
-                    if proc.pass_remaining == 0 {
-                        if let Some(inject) = proc.pending_inject.take() {
-                            out.extend_from_slice(&inject);
-                        }
-                        proc.phase = if proc.skip_remaining > 0 {
-                            Phase::Skip
-                        } else {
-                            Phase::Header
-                        };
-                    }
+                if proc.header_buf.len() < FRAME_HEADER_SIZE {
+                    continue;
                 }
 
-                Phase::Skip => {
-                    let take = proc.skip_remaining.min(data.len() - pos);
-                    pos += take; // discard bytes
-                    proc.skip_remaining -= take;
+                // Header complete — parse and build ops for this frame.
+                let mut header = parse_header(&proc.header_buf)
+                    .expect("header_buf is FRAME_HEADER_SIZE");
+                proc.header_buf.clear();
 
-                    if proc.skip_remaining == 0 {
-                        proc.phase = Phase::Header;
-                    }
+                if is_corrupt(&header) {
+                    eprintln!(
+                        "{} [CORRUPT] pcm_len={} pos_len={} meta_len={} pic_len={}, closing",
+                        ts(),
+                        header.pcm_len,
+                        header.pos_len,
+                        header.meta_len,
+                        header.pic_len,
+                    );
+                    return;
                 }
+
+                proc.frame_count += 1;
+                proc.build_frame_ops(&mut header);
+
+                // Push the (possibly rewritten) header to the front so it emits first.
+                let header_bytes = serialize_header(&header);
+                proc.ops.push_front(FrameOp::Emit(header_bytes.to_vec()));
             }
+
+            // Drain ops against the remaining data.
+            execute_ops(&mut proc.ops, data, &mut pos, &mut out);
         }
 
         if !out.is_empty() {

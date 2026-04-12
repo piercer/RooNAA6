@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC};
 use crate::metadata::{Metadata, PlayState, PlaybackPosition, SharedMetadata};
-use crate::proxy::{Action, FrameProcessor, Phase, PosAction};
+use crate::proxy::{Action, FrameProcessor, PosAction};
 
 const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
 const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
@@ -29,13 +29,12 @@ fn new_processor() -> FrameProcessor {
 #[test]
 fn new_defaults() {
     let proc = new_processor();
-    assert_eq!(proc.phase, Phase::Header);
+    assert!(proc.ops.is_empty());
     assert_eq!(proc.frame_count, 0);
     assert!(!proc.injected);
     assert!(proc.last_title.is_none());
-    assert!(proc.pending_inject.is_none());
-    assert_eq!(proc.pass_remaining, 0);
-    assert_eq!(proc.skip_remaining, 0);
+    assert!(proc.last_pos_state.is_none());
+    assert!(proc.pending_meta_pic.is_none());
     assert!(!proc.strip_logged);
     assert_eq!(proc.params.bits, 32);
     assert!(!proc.params.is_dsd);
@@ -46,25 +45,23 @@ fn reset_clears_state() {
     let mut proc = new_processor();
     proc.injected = true;
     proc.last_title = Some("Old Song".into());
+    proc.last_pos_state = Some(crate::metadata::PlayState::Playing);
     proc.frame_count = 500;
     proc.strip_logged = true;
-    proc.phase = Phase::Skip;
-    proc.pass_remaining = 1000;
-    proc.skip_remaining = 200;
-    proc.pending_inject = Some(vec![1, 2, 3]);
+    proc.pending_meta_pic = Some(vec![1, 2, 3]);
+    proc.ops.push_back(crate::proxy::FrameOp::Pass(100));
     proc.header_buf.extend_from_slice(&[0u8; 16]);
 
     proc.reset_for_start(DSD);
 
-    assert_eq!(proc.phase, Phase::Header);
+    assert!(proc.ops.is_empty());
     assert!(!proc.injected);
     assert!(proc.last_title.is_none());
+    assert!(proc.last_pos_state.is_none());
     assert_eq!(proc.frame_count, 0);
     assert!(!proc.strip_logged);
     assert!(proc.header_buf.is_empty());
-    assert_eq!(proc.pass_remaining, 0);
-    assert_eq!(proc.skip_remaining, 0);
-    assert!(proc.pending_inject.is_none());
+    assert!(proc.pending_meta_pic.is_none());
     assert_eq!(proc.params, DSD);
 }
 
@@ -86,7 +83,7 @@ fn inject_with_cover() {
     assert_eq!(h.pic_len, 4);
     assert_eq!(proc.last_title.as_deref(), Some("Title"));
 
-    let payload = proc.pending_inject.unwrap();
+    let payload = proc.pending_meta_pic.unwrap();
     assert!(payload.ends_with(&fake_jpeg));
 }
 
@@ -105,7 +102,7 @@ fn inject_without_cover() {
     assert_eq!(h.type_mask & TYPE_PIC, 0);
     assert_eq!(h.pic_len, 0);
 
-    let payload = proc.pending_inject.unwrap();
+    let payload = proc.pending_meta_pic.unwrap();
     assert!(!payload.windows(2).any(|w| w == [0xFF, 0xD8]));
 }
 
@@ -135,7 +132,7 @@ fn inject_meta_section_content() {
 
     proc.inject(&mut h, &m, false);
 
-    let payload = proc.pending_inject.unwrap();
+    let payload = proc.pending_meta_pic.unwrap();
     let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
     assert!(text.starts_with("[metadata]\n"));
     assert!(text.contains("song=My Song\n"));
@@ -155,7 +152,7 @@ fn inject_dsd_uses_base_rate() {
 
     proc.inject(&mut h, &m, false);
 
-    let payload = proc.pending_inject.unwrap();
+    let payload = proc.pending_meta_pic.unwrap();
     let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
     assert!(text.contains("samplerate=2822400\n"));
     assert!(text.contains("sdm=1\n"));
@@ -165,7 +162,7 @@ fn inject_dsd_uses_base_rate() {
 #[test]
 fn strip_clears_meta_and_pic() {
     let mut proc = new_processor();
-    proc.pending_inject = Some(vec![1, 2, 3]);
+    proc.pending_meta_pic = Some(vec![1, 2, 3]);
 
     let mut h = header(0x0D, 100, 50, 300, 5000);
     proc.strip(&mut h);
@@ -174,7 +171,7 @@ fn strip_clears_meta_and_pic() {
     assert_eq!(h.type_mask & TYPE_PIC, 0);
     assert_eq!(h.meta_len, 0);
     assert_eq!(h.pic_len, 0);
-    assert!(proc.pending_inject.is_none());
+    assert!(proc.pending_meta_pic.is_none());
 }
 
 #[test]
