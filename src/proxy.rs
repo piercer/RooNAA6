@@ -29,9 +29,10 @@ pub(crate) fn execute_ops(
     out: &mut Vec<u8>,
 ) {
     while let Some(op) = ops.front_mut() {
+        let remaining = data.len().saturating_sub(*pos);
         match op {
             FrameOp::Pass(n) => {
-                let take = (*n).min(data.len() - *pos);
+                let take = (*n).min(remaining);
                 out.extend_from_slice(&data[*pos..*pos + take]);
                 *pos += take;
                 *n -= take;
@@ -42,7 +43,7 @@ pub(crate) fn execute_ops(
                 }
             }
             FrameOp::Skip(n) => {
-                let take = (*n).min(data.len() - *pos);
+                let take = (*n).min(remaining);
                 *pos += take;
                 *n -= take;
                 if *n == 0 {

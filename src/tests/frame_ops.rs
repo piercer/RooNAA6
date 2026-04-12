@@ -97,3 +97,17 @@ fn resumes_after_blocking() {
     assert_eq!(pos2, 2);
     assert!(ops.is_empty());
 }
+
+#[test]
+fn zero_length_ops_drain_without_blocking() {
+    let mut ops = VecDeque::from(vec![
+        FrameOp::Pass(0),
+        FrameOp::Skip(0),
+        FrameOp::Emit(Vec::new()),
+        FrameOp::Pass(3),
+    ]);
+    let (out, pos) = run(&mut ops, b"xyz");
+    assert_eq!(out, b"xyz");
+    assert_eq!(pos, 3);
+    assert!(ops.is_empty());
+}
