@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC};
 use crate::metadata::{Metadata, SharedMetadata};
-use crate::proxy::{FrameProcessor, Phase};
+use crate::proxy::{Action, FrameProcessor, Phase};
 
 const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
 const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
@@ -173,6 +173,74 @@ fn strip_clears_meta_and_pic() {
     assert_eq!(h.meta_len, 0);
     assert_eq!(h.pic_len, 0);
     assert!(proc.pending_inject.is_none());
+}
+
+#[test]
+fn decide_strip_when_hqp_meta_arrives_before_roon_title() {
+    // Bug: HQPlayer's first META frame arrives before Roon WebSocket delivers
+    // now_playing. Previously this fell through to PASSTHROUGH and HQP's
+    // original title ("Roon") reached the T8.
+    let proc = new_processor();
+    assert!(!proc.injected);
+
+    let action = proc.decide_action(/* has_meta */ true, /* title */ "");
+
+    assert_eq!(action, Action::Strip);
+}
+
+#[test]
+fn decide_inject_first_meta_frame_with_title() {
+    let proc = new_processor();
+    assert_eq!(proc.decide_action(true, "Song"), Action::Inject);
+}
+
+#[test]
+fn decide_passthrough_audio_frame_no_title() {
+    let proc = new_processor();
+    assert_eq!(proc.decide_action(false, ""), Action::Passthrough);
+}
+
+#[test]
+fn decide_inject_on_audio_frame_when_title_arrives_late() {
+    // Title arrived after HQPlayer's META was already stripped.
+    // We must inject on the next audio frame — there won't be another META.
+    let proc = new_processor();
+    assert_eq!(proc.decide_action(false, "Song"), Action::Inject);
+}
+
+#[test]
+fn decide_gapless_on_track_change() {
+    let mut proc = new_processor();
+    proc.injected = true;
+    proc.last_title = Some("Old".into());
+    assert_eq!(proc.decide_action(false, "New"), Action::Gapless);
+    assert_eq!(proc.decide_action(true, "New"), Action::Gapless);
+}
+
+#[test]
+fn decide_strip_refresh_after_inject() {
+    let mut proc = new_processor();
+    proc.injected = true;
+    proc.last_title = Some("Song".into());
+    assert_eq!(proc.decide_action(true, "Song"), Action::Strip);
+}
+
+#[test]
+fn decide_refresh_every_300_frames() {
+    let mut proc = new_processor();
+    proc.injected = true;
+    proc.last_title = Some("Song".into());
+    proc.frame_count = 300;
+    assert_eq!(proc.decide_action(false, "Song"), Action::Refresh);
+}
+
+#[test]
+fn decide_passthrough_between_refreshes() {
+    let mut proc = new_processor();
+    proc.injected = true;
+    proc.last_title = Some("Song".into());
+    proc.frame_count = 150;
+    assert_eq!(proc.decide_action(false, "Song"), Action::Passthrough);
 }
 
 #[test]

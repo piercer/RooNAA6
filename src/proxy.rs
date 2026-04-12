@@ -41,6 +41,15 @@ pub(crate) enum Phase {
     Skip,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum Action {
+    Inject,
+    Gapless,
+    Strip,
+    Refresh,
+    Passthrough,
+}
+
 pub(crate) struct FrameProcessor {
     pub(crate) shared: SharedMetadata,
     pub(crate) params: StreamParams,
@@ -118,6 +127,32 @@ impl FrameProcessor {
         header.pic_len = 0;
         self.pending_inject = None;
     }
+
+    /// Pure decision function: given frame has_meta bit and current Roon title,
+    /// decide what to do with this frame. No side effects.
+    pub(crate) fn decide_action(&self, has_meta: bool, title: &str) -> Action {
+        if !title.is_empty() && !self.injected {
+            // First injection — trigger on any frame once Roon title is known.
+            // We don't wait for HQPlayer's META frame because it may have
+            // already been stripped (see next branch).
+            Action::Inject
+        } else if has_meta && !self.injected {
+            // HQPlayer sent META before Roon metadata arrived.
+            // Strip it so T8 doesn't show HQP's fallback title ("Roon").
+            Action::Strip
+        } else if !title.is_empty()
+            && self.injected
+            && self.last_title.as_deref() != Some(title)
+        {
+            Action::Gapless
+        } else if has_meta && self.injected {
+            Action::Strip
+        } else if self.injected && !title.is_empty() && self.frame_count % 300 == 0 {
+            Action::Refresh
+        } else {
+            Action::Passthrough
+        }
+    }
 }
 
 /// Handle XML data: log it, check for start messages, reset state, forward to dst.
@@ -147,10 +182,11 @@ fn handle_xml(
 /// State machine processes NAA v6 binary frames, injecting Roon metadata
 /// and cover art into the audio stream so the DAC displays track info.
 ///
-/// Actions:
-/// - INJECT: first META frame after start -- inject title/artist/album + cover art
+/// Actions (see FrameProcessor::decide_action):
+/// - INJECT: first frame once Roon title is known -- inject title/artist/album + cover
 /// - GAPLESS: track change during gapless playback -- inject new metadata + cover
-/// - STRIP: HQPlayer sends its own META refresh -- strip it to keep our metadata
+/// - STRIP: either HQPlayer META before Roon title (avoid "Roon" leaking to T8),
+///   or HQPlayer META refresh after we've already injected
 /// - REFRESH: periodic re-injection (~every 300 frames / ~30s) to prevent DAC revert
 /// - PASSTHROUGH: normal frames with no metadata work needed
 pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: SharedMetadata) {
@@ -247,9 +283,9 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                     proc.frame_count += 1;
 
                     // Decide action; replace_original means we strip the original meta/pic
-                    let replace_original =
-                        if !title.is_empty() && has_meta && !proc.injected {
-                            // INJECT: first META frame after start
+                    let action = proc.decide_action(has_meta, title);
+                    let replace_original = match action {
+                        Action::Inject => {
                             let jpeg_len = proc.inject(&mut header, &meta, true);
                             proc.injected = true;
                             eprintln!(
@@ -257,45 +293,39 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                                 ts(), title, meta.artist, meta.album, jpeg_len,
                             );
                             true
-                        } else if !title.is_empty()
-                            && proc.injected
-                            && proc.last_title.as_deref() != Some(title)
-                        {
-                            // GAPLESS: track changed during gapless playback
+                        }
+                        Action::Gapless => {
                             let jpeg_len = proc.inject(&mut header, &meta, true);
                             eprintln!(
                                 "{} [GAPLESS] {} / {} / {} + {}b cover",
                                 ts(), title, meta.artist, meta.album, jpeg_len,
                             );
                             true
-                        } else if has_meta && proc.injected {
-                            // STRIP: HQPlayer META refresh -- strip to keep our metadata
+                        }
+                        Action::Strip => {
                             proc.strip(&mut header);
                             if !proc.strip_logged {
                                 eprintln!(
-                                    "{} [STRIP] META refresh stripped (frame {})",
-                                    ts(),
-                                    proc.frame_count,
+                                    "{} [STRIP] META stripped (frame {}, injected={})",
+                                    ts(), proc.frame_count, proc.injected,
                                 );
                                 proc.strip_logged = true;
                             }
                             true
-                        } else if proc.injected
-                            && !title.is_empty()
-                            && proc.frame_count % 300 == 0
-                        {
-                            // REFRESH: periodic re-injection (~30s)
+                        }
+                        Action::Refresh => {
                             proc.inject(&mut header, &meta, false);
                             eprintln!(
                                 "{} [REFRESH] {} (frame {})",
                                 ts(), title, proc.frame_count,
                             );
                             true
-                        } else {
-                            // PASSTHROUGH: no metadata work needed
+                        }
+                        Action::Passthrough => {
                             proc.pending_inject = None;
                             false
-                        };
+                        }
+                    };
 
                     if replace_original {
                         proc.pass_remaining = pcm_bytes + pos_bytes;
