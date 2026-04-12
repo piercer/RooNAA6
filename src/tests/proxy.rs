@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC};
 use crate::metadata::{Metadata, PlayState, PlaybackPosition, SharedMetadata};
-use crate::proxy::{Action, FrameProcessor, PosAction};
+use crate::proxy::{Action, FrameOp, FrameProcessor, PosAction};
 
 const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
 const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
@@ -314,4 +314,128 @@ fn decide_pos_paused_mid_cadence_passthrough() {
     proc.last_pos_state = Some(PlayState::Paused);
     let p = pos_now(PlayState::Paused);
     assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Passthrough);
+}
+
+fn set_position(shared: &SharedMetadata, state: PlayState) {
+    let mut m = shared.get();
+    m.position = Some(PlaybackPosition {
+        length_seconds: 225,
+        position_seconds: 10.0,
+        captured_at: Instant::now(),
+        state,
+        track: 1,
+        tracks_total: 5,
+    });
+    shared.set(m);
+}
+
+fn body_header(pcm_len: u32, pos_len: u32) -> FrameHeader {
+    FrameHeader {
+        raw: [0u8; crate::frame::FRAME_HEADER_SIZE],
+        type_mask: 0x11, // PCM | POS
+        pcm_len,
+        pos_len,
+        meta_len: 0,
+        pic_len: 0,
+    }
+}
+
+#[test]
+fn build_frame_ops_injects_pos_on_first_sight() {
+    let shared = SharedMetadata::new();
+    set_position(&shared, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.frame_count = 1;
+
+    let mut header = body_header(100, 50);
+    proc.build_frame_ops(&mut header);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(
+        matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4),
+        "first op should pass PCM bytes, got {ops:?}"
+    );
+    assert!(
+        matches!(ops[1], FrameOp::Skip(50)),
+        "second op should skip orig pos_len, got {ops:?}"
+    );
+    assert!(
+        matches!(ops[2], FrameOp::Emit(_)),
+        "third op should emit new pos body, got {ops:?}"
+    );
+    assert!(header.pos_len > 0);
+    assert_eq!(proc.last_pos_state, Some(PlayState::Playing));
+}
+
+#[test]
+fn build_frame_ops_passes_pos_when_no_position_in_shared() {
+    let shared = SharedMetadata::new();
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.frame_count = 1;
+
+    let mut header = body_header(100, 50);
+    proc.build_frame_ops(&mut header);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(
+        matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4 + 50),
+        "first op should pass pcm+pos, got {ops:?}"
+    );
+    assert!(proc.last_pos_state.is_none());
+    assert_eq!(header.pos_len, 50);
+}
+
+#[test]
+fn build_frame_ops_passes_pos_mid_cadence() {
+    let shared = SharedMetadata::new();
+    set_position(&shared, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.frame_count = 7;
+    proc.last_pos_state = Some(PlayState::Playing);
+
+    let mut header = body_header(100, 50);
+    proc.build_frame_ops(&mut header);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4 + 50));
+    assert_eq!(header.pos_len, 50);
+}
+
+#[test]
+fn build_frame_ops_injects_pos_on_state_change() {
+    let shared = SharedMetadata::new();
+    set_position(&shared, PlayState::Paused);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.frame_count = 7;
+    proc.last_pos_state = Some(PlayState::Playing);
+
+    let mut header = body_header(100, 50);
+    proc.build_frame_ops(&mut header);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Skip(50)));
+    assert!(matches!(ops[2], FrameOp::Emit(_)));
+    assert_eq!(proc.last_pos_state, Some(PlayState::Paused));
+}
+
+#[test]
+fn build_frame_ops_pos_with_no_orig_pos_section() {
+    let shared = SharedMetadata::new();
+    set_position(&shared, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.frame_count = 1;
+
+    let mut header = body_header(100, 0);
+    proc.build_frame_ops(&mut header);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Emit(_)));
+    assert!(header.pos_len > 0);
 }

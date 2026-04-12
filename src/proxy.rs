@@ -4,7 +4,7 @@ use std::net::TcpStream;
 
 use crate::frame::{
     build_meta_section, is_corrupt, parse_header, parse_start_message, serialize_header,
-    FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC,
+    FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC, TYPE_POS,
 };
 use crate::metadata::{Metadata, SharedMetadata};
 use crate::ts;
@@ -233,15 +233,19 @@ impl FrameProcessor {
     /// Mutates `header` to reflect final meta_len/pic_len values.
     /// The header serialisation itself is pushed by the caller.
     pub(crate) fn build_frame_ops(&mut self, header: &mut FrameHeader) {
+        use crate::frame::build_pos_section;
+
         let pcm_bytes = header.pcm_len as usize * self.params.bytes_per_sample as usize;
-        let pos_bytes = header.pos_len as usize;
+        let orig_pos_len = header.pos_len as usize;
         let orig_meta_len = header.meta_len as usize;
         let orig_pic_len = header.pic_len as usize;
         let has_meta = header.has_meta();
 
         let meta = self.shared.get();
         let title = meta.title.clone();
+        let pos_ref = meta.position.as_ref();
 
+        // --- Meta/pic decision (unchanged) ---
         let action = self.decide_action(has_meta, &title);
         let replace_meta_pic = match action {
             Action::Inject => {
@@ -283,9 +287,34 @@ impl FrameProcessor {
             Action::Passthrough => false,
         };
 
+        // --- POS decision ---
+        let pos_action = self.decide_pos_action(pos_ref);
+        let (pos_bytes, replace_pos): (Vec<u8>, bool) = match pos_action {
+            PosAction::Inject => {
+                let pos = pos_ref.expect("decide_pos_action returned Inject only when Some");
+                let bytes = build_pos_section(pos, std::time::Instant::now());
+                header.pos_len = bytes.len() as u32;
+                header.type_mask |= TYPE_POS;
+                self.last_pos_state = Some(pos.state);
+                (bytes, true)
+            }
+            PosAction::Passthrough => (Vec::new(), false),
+        };
+
+        // --- Build op sequence ---
         // Body layout: [pcm][pos][meta][pic]
-        // Task 5 behaviour: POS is always passed through unchanged.
-        self.ops.push_back(FrameOp::Pass(pcm_bytes + pos_bytes));
+        if replace_pos {
+            self.ops.push_back(FrameOp::Pass(pcm_bytes));
+            if orig_pos_len > 0 {
+                self.ops.push_back(FrameOp::Skip(orig_pos_len));
+            }
+            self.ops.push_back(FrameOp::Emit(pos_bytes));
+        } else {
+            // Coalesce PCM and pass-through POS into a single Pass.
+            self.ops.push_back(FrameOp::Pass(pcm_bytes + orig_pos_len));
+        }
+
+        // Meta/pic region
         if replace_meta_pic {
             if orig_meta_len + orig_pic_len > 0 {
                 self.ops.push_back(FrameOp::Skip(orig_meta_len + orig_pic_len));

@@ -4,6 +4,7 @@ use std::time::Instant;
 pub const FRAME_HEADER_SIZE: usize = 32;
 pub const TYPE_PIC: u32 = 0x04;
 pub const TYPE_META: u32 = 0x08;
+pub const TYPE_POS: u32 = 0x10;
 
 #[derive(Debug)]
 pub struct FrameHeader {
