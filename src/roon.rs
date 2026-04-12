@@ -165,6 +165,8 @@ fn run_once(
                 }
             }
         }
+
+        apply_zones_seek(shared, &body);
     }
 }
 
@@ -213,6 +215,35 @@ pub(crate) fn extract_playback_position(
         track,
         tracks_total,
     })
+}
+
+/// Apply a `zones_seek_changed` body to the shared metadata. Updates only
+/// position_seconds and captured_at on an existing PlaybackPosition —
+/// title/artist/album and length are untouched. No-op if there's no prior
+/// PlaybackPosition (we need length to build one).
+pub(crate) fn apply_zones_seek(shared: &SharedMetadata, body: &Value) {
+    let seeks = match body.get("zones_seek_changed").and_then(|v| v.as_array()) {
+        Some(s) => s,
+        None => return,
+    };
+    if seeks.is_empty() {
+        return;
+    }
+
+    let mut meta = shared.get();
+    let Some(mut pos) = meta.position else { return };
+
+    let entry = &seeks[0];
+    let Some(seek) = entry
+        .get("seek_position")
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+    else {
+        return;
+    };
+    pos.position_seconds = seek;
+    pos.captured_at = std::time::Instant::now();
+    meta.position = Some(pos);
+    shared.set(meta);
 }
 
 fn extract_track_info(np: &Value) -> (String, String, String) {

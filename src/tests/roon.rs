@@ -66,3 +66,83 @@ fn tracks_total_defaults_when_missing() {
     let p = extract_playback_position(&z, Instant::now()).unwrap();
     assert_eq!(p.tracks_total, 1);
 }
+
+use std::sync::Arc;
+
+use crate::metadata::{Metadata, PlaybackPosition, SharedMetadata};
+use crate::roon::apply_zones_seek;
+
+fn seeded_shared(state: PlayState) -> SharedMetadata {
+    let shared = SharedMetadata::new();
+    shared.set(Metadata {
+        title: "Song".into(),
+        artist: "Artist".into(),
+        album: "Album".into(),
+        cover_art: Some(Arc::new(vec![0xFF, 0xD8])),
+        position: Some(PlaybackPosition {
+            length_seconds: 225,
+            position_seconds: 10.0,
+            captured_at: Instant::now(),
+            state,
+            track: 1,
+            tracks_total: 3,
+        }),
+    });
+    shared
+}
+
+#[test]
+fn zones_seek_updates_position_and_captured_at() {
+    let shared = seeded_shared(PlayState::Playing);
+    let before = shared.get().position.unwrap().captured_at;
+
+    let body = json!({
+        "zones_seek_changed": [
+            {
+                "zone_id": "z1",
+                "seek_position": 50.0,
+                "queue_time_remaining": 175,
+            }
+        ]
+    });
+    apply_zones_seek(&shared, &body);
+
+    let after = shared.get().position.unwrap();
+    assert_eq!(after.position_seconds, 50.0);
+    assert!(after.captured_at > before);
+    assert_eq!(shared.get().title, "Song");
+}
+
+#[test]
+fn zones_seek_preserves_paused_state() {
+    let shared = seeded_shared(PlayState::Paused);
+    let body = json!({
+        "zones_seek_changed": [
+            { "zone_id": "z1", "seek_position": 15.0 }
+        ]
+    });
+    apply_zones_seek(&shared, &body);
+    let p = shared.get().position.unwrap();
+    assert_eq!(p.state, PlayState::Paused);
+    assert_eq!(p.position_seconds, 15.0);
+}
+
+#[test]
+fn zones_seek_noop_if_no_position_yet() {
+    let shared = SharedMetadata::new();
+    let body = json!({
+        "zones_seek_changed": [
+            { "zone_id": "z1", "seek_position": 15.0 }
+        ]
+    });
+    apply_zones_seek(&shared, &body);
+    assert!(shared.get().position.is_none());
+}
+
+#[test]
+fn zones_seek_ignored_when_body_has_no_seek_array() {
+    let shared = seeded_shared(PlayState::Playing);
+    let body = json!({ "zones_changed": [] });
+    apply_zones_seek(&shared, &body);
+    assert_eq!(shared.get().position.unwrap().position_seconds, 10.0);
+}
