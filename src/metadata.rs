@@ -8,7 +8,6 @@ pub enum PlayState {
     Paused,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct PlaybackPosition {
     pub length_seconds: u32,

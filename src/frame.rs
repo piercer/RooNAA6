@@ -132,3 +132,67 @@ pub fn is_corrupt(header: &FrameHeader) -> bool {
         || header.meta_len > 100_000
         || header.pic_len > 1_000_000
 }
+
+use crate::metadata::{PlayState, PlaybackPosition};
+use std::time::Instant;
+
+/// Build a NAA `[position]` section matching HQPlayer's byte layout.
+///
+/// Format: `[position]\n` + `key=value\n` lines + `\0`.
+/// 13 fields in HQPlayer's emitted order — unknown or reordered fields
+/// cause the T8's whitelist parser to reject the whole section.
+pub fn build_pos_section(pos: &PlaybackPosition, now: Instant) -> Vec<u8> {
+    use std::io::Write;
+
+    let elapsed = if matches!(pos.state, PlayState::Playing) {
+        now.saturating_duration_since(pos.captured_at).as_secs_f64()
+    } else {
+        0.0
+    };
+    let length_f = f64::from(pos.length_seconds);
+    let effective_pos = (pos.position_seconds + elapsed).clamp(0.0, length_f);
+
+    let total_secs = pos.length_seconds;
+    let total_min = total_secs / 60;
+    let total_sec = total_secs % 60;
+
+    let remain = (length_f - effective_pos).max(0.0) as u32;
+    let remain_min = remain / 60;
+    let remain_sec = remain % 60;
+
+    let begin = effective_pos as u32;
+    let begin_min = begin / 60;
+    let begin_sec = begin % 60;
+
+    let state_str = match pos.state {
+        PlayState::Playing => "PLAYING",
+        PlayState::Paused => "PAUSED",
+    };
+
+    let mut section = Vec::with_capacity(320);
+    write!(
+        section,
+        "[position]\n\
+         apod=0\n\
+         begin_min={begin_min}\n\
+         begin_sec={begin_sec}\n\
+         clips=0\n\
+         correction=0\n\
+         input_fill=-1.00000000000000000\n\
+         length={length_f:.17}\n\
+         output_fill=0.00000000000000000\n\
+         position={effective_pos:.17}\n\
+         remain_min={remain_min}\n\
+         remain_sec={remain_sec}\n\
+         state={state_str}\n\
+         total_min={total_min}\n\
+         total_sec={total_sec}\n\
+         track={track}\n\
+         tracks_total={tracks_total}\n",
+        track = pos.track,
+        tracks_total = pos.tracks_total,
+    )
+    .unwrap();
+    section.push(0x00);
+    section
+}
