@@ -87,21 +87,15 @@ pub fn forward_passthrough(mut src: TcpStream, mut dst: TcpStream, label: &str) 
     }
 }
 
-/// How often we must re-emit the [metadata] section even when content
-/// is unchanged. The T8 reverts the title to HQPlayer's "Roon" fallback
-/// if META goes quiet for too long — cover and POS are held correctly.
-pub(crate) const META_REFRESH_FRAMES: u64 = 300;
-
 pub(crate) struct FrameProcessor {
     pub(crate) shared: SharedMetadata,
     pub(crate) params: StreamParams,
     pub(crate) ops: VecDeque<FrameOp>,
     pub(crate) header_buf: Vec<u8>,
-    /// (title, artist, album) last emitted as META. Used for content-change
-    /// detection (which also governs whether to bundle a fresh cover).
+    /// (title, artist, album) last emitted as META. Used to decide whether
+    /// a fresh PIC should ride along — cover is only re-sent on track
+    /// change, since it's heavy (~50KB) and the T8 holds it between sends.
     pub(crate) last_meta_key: Option<(String, String, String)>,
-    /// Frame number of the last META emission — drives the cadence refresh.
-    pub(crate) last_meta_frame: u64,
     /// (length, seek rounded to integer seconds, state) last emitted as POS.
     pub(crate) last_pos_key: Option<(u32, u32, crate::metadata::PlayState)>,
     pub(crate) frame_count: u64,
@@ -120,7 +114,6 @@ impl FrameProcessor {
             ops: VecDeque::new(),
             header_buf: Vec::with_capacity(FRAME_HEADER_SIZE),
             last_meta_key: None,
-            last_meta_frame: 0,
             last_pos_key: None,
             frame_count: 0,
         }
@@ -129,7 +122,6 @@ impl FrameProcessor {
     pub(crate) fn reset_for_start(&mut self, params: StreamParams) {
         self.params = params;
         self.last_meta_key = None;
-        self.last_meta_frame = 0;
         self.last_pos_key = None;
         self.frame_count = 0;
         self.header_buf.clear();
@@ -179,51 +171,40 @@ impl FrameProcessor {
             _ => None,
         };
 
-        // --- META/PIC: strip HQP, emit ours on change or cadence refresh ---
-        // Two triggers:
-        //   1. content_changed — (title, artist, album) differs from last
-        //      emission. Bundle a fresh cover.
-        //   2. cadence refresh — text-only re-emit every META_REFRESH_FRAMES
-        //      frames so the T8 doesn't revert the title.
+        // --- META/PIC: strip HQP, emit META on every frame ---
+        // The T8 reverts the title to HQPlayer's "Roon" fallback within a
+        // few seconds if META goes quiet, so we re-emit the [metadata]
+        // section on every frame once Roon has populated a title. The
+        // section is ~256 bytes — trivial overhead at PCM frame rates.
+        // PIC is heavy (~50KB), so the cover only rides along when the
+        // track actually changes; the T8 holds it between sends.
         let meta_key: Option<(String, String, String)> = if meta.title.is_empty() {
             None
         } else {
             Some((meta.title.clone(), meta.artist.clone(), meta.album.clone()))
         };
         let content_changed = meta_key.is_some() && self.last_meta_key != meta_key;
-        let refresh_due = meta_key.is_some()
-            && self
-                .frame_count
-                .saturating_sub(self.last_meta_frame)
-                >= META_REFRESH_FRAMES;
-        // Emitted META section bytes, and — separately — whether to emit a
-        // fresh PIC section with the cover. PIC only rides along on content
-        // changes; cadence refreshes are text-only so we don't resend the
-        // full JPEG every ~70s.
-        let meta_section: Option<Vec<u8>> =
-            if meta_key.is_some() && (content_changed || refresh_due) {
-                Some(build_meta_section(
-                    &self.params,
-                    &meta.title,
-                    &meta.artist,
-                    &meta.album,
-                ))
-            } else {
-                None
-            };
+        let meta_section: Option<Vec<u8>> = if meta_key.is_some() {
+            Some(build_meta_section(
+                &self.params,
+                &meta.title,
+                &meta.artist,
+                &meta.album,
+            ))
+        } else {
+            None
+        };
         let cover_bytes: Option<Arc<Vec<u8>>> = if content_changed {
             meta.cover_art.clone()
         } else {
             None
         };
-        if meta_section.is_some() {
-            let kind = if content_changed { "change" } else { "refresh" };
+        if content_changed {
             eprintln!(
-                "{} [META] {} {} / {} / {} (frame {})",
-                ts(), kind, meta.title, meta.artist, meta.album, self.frame_count,
+                "{} [META] change {} / {} / {} (frame {})",
+                ts(), meta.title, meta.artist, meta.album, self.frame_count,
             );
             self.last_meta_key = meta_key;
-            self.last_meta_frame = self.frame_count;
         }
 
         // --- Rewrite header ---

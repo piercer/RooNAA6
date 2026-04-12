@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC, TYPE_POS};
 use crate::metadata::{Metadata, PlayState, SharedMetadata};
-use crate::proxy::{FrameOp, FrameProcessor, META_REFRESH_FRAMES};
+use crate::proxy::{FrameOp, FrameProcessor};
 
 const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
 const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
@@ -45,7 +45,6 @@ fn new_defaults() {
 fn reset_for_start_clears_all_keys() {
     let mut proc = FrameProcessor::new(SharedMetadata::new());
     proc.last_meta_key = Some(("t".into(), "a".into(), "b".into()));
-    proc.last_meta_frame = 450;
     proc.last_pos_key = Some((225, 10, PlayState::Playing));
     proc.frame_count = 500;
     proc.ops.push_back(FrameOp::Pass(100));
@@ -54,7 +53,6 @@ fn reset_for_start_clears_all_keys() {
     proc.reset_for_start(DSD);
 
     assert!(proc.last_meta_key.is_none());
-    assert_eq!(proc.last_meta_frame, 0);
     assert!(proc.last_pos_key.is_none());
     assert_eq!(proc.frame_count, 0);
     assert_eq!(proc.params, DSD);
@@ -118,54 +116,31 @@ fn emits_meta_on_first_sight_when_title_known() {
 }
 
 #[test]
-fn skips_hqp_meta_when_key_unchanged_mid_cadence() {
-    let shared = SharedMetadata::new();
-    seed_track(&shared, "Song", None);
-    let mut proc = FrameProcessor::new(shared);
-    proc.params = PCM;
-    proc.last_meta_key = Some(("Song".into(), "Artist".into(), "Album".into()));
-    // Mid-cadence: a handful of frames since last emission.
-    proc.frame_count = 50;
-    proc.last_meta_frame = 10;
-
-    // HQP sent META bytes — must be stripped, no replacement emitted.
-    let mut h = header(0x01 | TYPE_META, 100, 0, 250, 0);
-    proc.build_frame_ops(&mut h);
-
-    assert_eq!(h.type_mask & TYPE_META, 0);
-    assert_eq!(h.meta_len, 0);
-
-    let ops: Vec<_> = proc.ops.iter().collect();
-    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
-    assert!(matches!(ops[1], FrameOp::Skip(250)));
-    assert_eq!(
-        ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count(),
-        0,
-    );
-}
-
-#[test]
-fn refreshes_meta_text_without_cover_on_cadence() {
+fn reemits_meta_every_frame_without_cover_when_key_unchanged() {
+    // META text is re-sent on every frame once the title is known,
+    // so the T8 never reverts to HQPlayer's "Roon" fallback. Cover
+    // stays strictly change-driven — no re-send while the key holds.
     let shared = SharedMetadata::new();
     seed_track(&shared, "Song", Some(&vec![0xFFu8; 40000]));
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
     proc.last_meta_key = Some(("Song".into(), "Artist".into(), "Album".into()));
-    proc.frame_count = META_REFRESH_FRAMES + 1;
-    proc.last_meta_frame = 1;
+    proc.frame_count = 50;
 
-    let mut h = header(0x01, 100, 0, 0, 0);
+    // HQP sent META bytes — must be stripped, and replaced with ours.
+    let mut h = header(0x01 | TYPE_META, 100, 0, 250, 0);
     proc.build_frame_ops(&mut h);
 
-    // META re-emitted, but cover NOT re-sent on refresh.
     assert_ne!(h.type_mask & TYPE_META, 0);
     assert_eq!(h.type_mask & TYPE_PIC, 0);
     assert_eq!(h.pic_len, 0);
     assert!(h.meta_len > 0);
-    assert_eq!(proc.last_meta_frame, META_REFRESH_FRAMES + 1);
 
-    let emits = proc.ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
-    assert_eq!(emits, 1, "refresh should emit only meta text, not cover");
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Skip(250)));
+    let emits = ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
+    assert_eq!(emits, 1, "re-emit meta text only, no cover");
 }
 
 #[test]
@@ -175,9 +150,7 @@ fn emits_new_meta_with_cover_on_track_change() {
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
     proc.last_meta_key = Some(("Old Song".into(), "Artist".into(), "Album".into()));
-    // Mid-cadence so only the content change triggers emission.
     proc.frame_count = 50;
-    proc.last_meta_frame = 10;
 
     let mut h = header(0x01, 100, 0, 0, 0);
     proc.build_frame_ops(&mut h);
