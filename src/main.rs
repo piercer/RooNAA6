@@ -4,6 +4,8 @@ mod frame;
 mod metadata;
 mod proxy;
 mod roon;
+#[cfg(test)]
+mod tests;
 
 use std::time::SystemTime;
 

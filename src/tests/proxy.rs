@@ -1,0 +1,188 @@
+use std::sync::Arc;
+
+use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC};
+use crate::metadata::{Metadata, SharedMetadata};
+use crate::proxy::{FrameProcessor, Phase};
+
+const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
+const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
+
+fn header(type_mask: u32, pcm_len: u32, pos_len: u32, meta_len: u32, pic_len: u32) -> FrameHeader {
+    FrameHeader { raw: [0u8; FRAME_HEADER_SIZE], type_mask, pcm_len, pos_len, meta_len, pic_len }
+}
+
+fn meta(title: &str, artist: &str, album: &str, cover: Option<&[u8]>) -> Metadata {
+    Metadata {
+        title: title.to_string(),
+        artist: artist.to_string(),
+        album: album.to_string(),
+        cover_art: cover.map(|c| Arc::new(c.to_vec())),
+    }
+}
+
+fn new_processor() -> FrameProcessor {
+    FrameProcessor::new(SharedMetadata::new())
+}
+
+#[test]
+fn new_defaults() {
+    let proc = new_processor();
+    assert_eq!(proc.phase, Phase::Header);
+    assert_eq!(proc.frame_count, 0);
+    assert!(!proc.injected);
+    assert!(proc.last_title.is_none());
+    assert!(proc.pending_inject.is_none());
+    assert_eq!(proc.pass_remaining, 0);
+    assert_eq!(proc.skip_remaining, 0);
+    assert!(!proc.strip_logged);
+    assert_eq!(proc.params.bits, 32);
+    assert!(!proc.params.is_dsd);
+}
+
+#[test]
+fn reset_clears_state() {
+    let mut proc = new_processor();
+    proc.injected = true;
+    proc.last_title = Some("Old Song".into());
+    proc.frame_count = 500;
+    proc.strip_logged = true;
+    proc.phase = Phase::Skip;
+    proc.pass_remaining = 1000;
+    proc.skip_remaining = 200;
+    proc.pending_inject = Some(vec![1, 2, 3]);
+    proc.header_buf.extend_from_slice(&[0u8; 16]);
+
+    proc.reset_for_start(DSD);
+
+    assert_eq!(proc.phase, Phase::Header);
+    assert!(!proc.injected);
+    assert!(proc.last_title.is_none());
+    assert_eq!(proc.frame_count, 0);
+    assert!(!proc.strip_logged);
+    assert!(proc.header_buf.is_empty());
+    assert_eq!(proc.pass_remaining, 0);
+    assert_eq!(proc.skip_remaining, 0);
+    assert!(proc.pending_inject.is_none());
+    assert_eq!(proc.params, DSD);
+}
+
+#[test]
+fn inject_with_cover() {
+    let mut proc = new_processor();
+    proc.params = PCM;
+
+    let fake_jpeg = vec![0xFF, 0xD8, 0x00, 0x01];
+    let m = meta("Title", "Artist", "Album", Some(&fake_jpeg));
+    let mut h = header(0x01, 100, 50, 0, 0);
+
+    let jpeg_len = proc.inject(&mut h, &m, true);
+
+    assert_eq!(jpeg_len, 4);
+    assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_ne!(h.type_mask & TYPE_PIC, 0);
+    assert_ne!(h.meta_len, 0);
+    assert_eq!(h.pic_len, 4);
+    assert_eq!(proc.last_title.as_deref(), Some("Title"));
+
+    let payload = proc.pending_inject.unwrap();
+    assert!(payload.ends_with(&fake_jpeg));
+}
+
+#[test]
+fn inject_without_cover() {
+    let mut proc = new_processor();
+    proc.params = PCM;
+
+    let m = meta("Title", "Artist", "Album", Some(&[0xFF, 0xD8]));
+    let mut h = header(0x01, 100, 50, 0, 0);
+
+    let jpeg_len = proc.inject(&mut h, &m, false);
+
+    assert_eq!(jpeg_len, 0);
+    assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_eq!(h.type_mask & TYPE_PIC, 0);
+    assert_eq!(h.pic_len, 0);
+
+    let payload = proc.pending_inject.unwrap();
+    assert!(!payload.windows(2).any(|w| w == [0xFF, 0xD8]));
+}
+
+#[test]
+fn inject_no_cover_art_available() {
+    let mut proc = new_processor();
+    proc.params = PCM;
+
+    let m = meta("Title", "Artist", "Album", None);
+    let mut h = header(0x01, 100, 50, 0, 0);
+
+    let jpeg_len = proc.inject(&mut h, &m, true);
+
+    assert_eq!(jpeg_len, 0);
+    assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_eq!(h.type_mask & TYPE_PIC, 0);
+    assert_eq!(h.pic_len, 0);
+}
+
+#[test]
+fn inject_meta_section_content() {
+    let mut proc = new_processor();
+    proc.params = PCM;
+
+    let m = meta("My Song", "My Artist", "My Album", None);
+    let mut h = header(0x09, 100, 50, 200, 0);
+
+    proc.inject(&mut h, &m, false);
+
+    let payload = proc.pending_inject.unwrap();
+    let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
+    assert!(text.starts_with("[metadata]\n"));
+    assert!(text.contains("song=My Song\n"));
+    assert!(text.contains("artist=My Artist\n"));
+    assert!(text.contains("album=My Album\n"));
+    assert!(text.contains("samplerate=44100\n"));
+    assert!(text.contains("sdm=0\n"));
+}
+
+#[test]
+fn inject_dsd_uses_base_rate() {
+    let mut proc = new_processor();
+    proc.params = DSD;
+
+    let m = meta("DSD Track", "Artist", "Album", None);
+    let mut h = header(0x09, 100, 50, 200, 0);
+
+    proc.inject(&mut h, &m, false);
+
+    let payload = proc.pending_inject.unwrap();
+    let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
+    assert!(text.contains("samplerate=2822400\n"));
+    assert!(text.contains("sdm=1\n"));
+    assert!(text.contains("bits=1\n"));
+}
+
+#[test]
+fn strip_clears_meta_and_pic() {
+    let mut proc = new_processor();
+    proc.pending_inject = Some(vec![1, 2, 3]);
+
+    let mut h = header(0x0D, 100, 50, 300, 5000);
+    proc.strip(&mut h);
+
+    assert_eq!(h.type_mask & TYPE_META, 0);
+    assert_eq!(h.type_mask & TYPE_PIC, 0);
+    assert_eq!(h.meta_len, 0);
+    assert_eq!(h.pic_len, 0);
+    assert!(proc.pending_inject.is_none());
+}
+
+#[test]
+fn strip_preserves_other_type_bits() {
+    let mut proc = new_processor();
+
+    // 0x1D = PCM(0x01) | PIC(0x04) | META(0x08) | POS(0x10)
+    let mut h = header(0x1D, 100, 50, 300, 5000);
+    proc.strip(&mut h);
+
+    // After strip: PCM(0x01) | POS(0x10) = 0x11
+    assert_eq!(h.type_mask, 0x11);
+}
