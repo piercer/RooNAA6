@@ -50,6 +50,12 @@ pub(crate) enum Action {
     Passthrough,
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum PosAction {
+    Inject,
+    Passthrough,
+}
+
 pub(crate) struct FrameProcessor {
     pub(crate) shared: SharedMetadata,
     pub(crate) params: StreamParams,
@@ -60,6 +66,7 @@ pub(crate) struct FrameProcessor {
     pub(crate) header_buf: Vec<u8>,
     pub(crate) injected: bool,
     pub(crate) last_title: Option<String>,
+    pub(crate) last_pos_state: Option<crate::metadata::PlayState>,
     pub(crate) frame_count: u64,
     pub(crate) strip_logged: bool,
 }
@@ -81,6 +88,7 @@ impl FrameProcessor {
             header_buf: Vec::with_capacity(FRAME_HEADER_SIZE),
             injected: false,
             last_title: None,
+            last_pos_state: None,
             frame_count: 0,
             strip_logged: false,
         }
@@ -91,6 +99,7 @@ impl FrameProcessor {
         self.phase = Phase::Header;
         self.injected = false;
         self.last_title = None;
+        self.last_pos_state = None;
         self.frame_count = 0;
         self.strip_logged = false;
         self.header_buf.clear();
@@ -152,6 +161,33 @@ impl FrameProcessor {
         } else {
             Action::Passthrough
         }
+    }
+
+    /// Pure decision: given current playback position, decide whether to inject
+    /// a new [position] section this frame.
+    pub(crate) fn decide_pos_action(
+        &self,
+        pos: Option<&crate::metadata::PlaybackPosition>,
+    ) -> PosAction {
+        const POS_CADENCE_FRAMES: u64 = 20;
+
+        let Some(pos) = pos else {
+            return PosAction::Passthrough;
+        };
+
+        if self.last_pos_state.is_none() {
+            return PosAction::Inject;
+        }
+
+        if self.last_pos_state != Some(pos.state) {
+            return PosAction::Inject;
+        }
+
+        if self.frame_count % POS_CADENCE_FRAMES == 0 {
+            return PosAction::Inject;
+        }
+
+        PosAction::Passthrough
     }
 }
 
