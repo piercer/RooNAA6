@@ -8,31 +8,31 @@ use crate::roon::extract_playback_position;
 fn zone(state: &str, seek: f64, length: u64) -> serde_json::Value {
     json!({
         "state": state,
-        "seek_position": seek,
-        "now_playing": { "length": length },
+        "now_playing": { "length": length, "seek_position": seek },
     })
 }
 
 #[test]
 fn extracts_playing_zone() {
     let z = zone("playing", 42.0, 225);
-    let p = extract_playback_position(&z, Instant::now()).unwrap();
+    let (p, seek_present) = extract_playback_position(&z, Instant::now()).unwrap();
     assert_eq!(p.state, PlayState::Playing);
     assert_eq!(p.length_seconds, 225);
     assert_eq!(p.position_seconds, 42.0);
+    assert!(seek_present);
 }
 
 #[test]
 fn extracts_paused_zone() {
     let z = zone("paused", 11.0, 180);
-    let p = extract_playback_position(&z, Instant::now()).unwrap();
+    let (p, _) = extract_playback_position(&z, Instant::now()).unwrap();
     assert_eq!(p.state, PlayState::Paused);
 }
 
 #[test]
 fn loading_state_maps_to_playing() {
     let z = zone("loading", 0.0, 200);
-    let p = extract_playback_position(&z, Instant::now()).unwrap();
+    let (p, _) = extract_playback_position(&z, Instant::now()).unwrap();
     assert_eq!(p.state, PlayState::Playing);
 }
 
@@ -43,9 +43,16 @@ fn stopped_state_returns_none() {
 }
 
 #[test]
-fn missing_seek_position_returns_none() {
+fn missing_seek_position_bootstraps_and_flags() {
+    // Roon does not always include seek_position in zone-level now_playing
+    // updates — only at state transitions. Bootstrap to 0.0 and flag
+    // seek_present=false so the handler can merge-preserve prior state.
     let z = json!({ "state": "playing", "now_playing": { "length": 200 } });
-    assert!(extract_playback_position(&z, Instant::now()).is_none());
+    let (p, seek_present) = extract_playback_position(&z, Instant::now()).unwrap();
+    assert_eq!(p.position_seconds, 0.0);
+    assert_eq!(p.length_seconds, 200);
+    assert_eq!(p.state, PlayState::Playing);
+    assert!(!seek_present);
 }
 
 #[test]
@@ -63,7 +70,7 @@ fn missing_now_playing_returns_none() {
 #[test]
 fn tracks_total_defaults_when_missing() {
     let z = zone("playing", 0.0, 200);
-    let p = extract_playback_position(&z, Instant::now()).unwrap();
+    let (p, _) = extract_playback_position(&z, Instant::now()).unwrap();
     assert_eq!(p.tracks_total, 1);
 }
 
