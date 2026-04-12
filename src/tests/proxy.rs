@@ -246,12 +246,12 @@ fn decide_passthrough_between_refreshes() {
 fn strip_preserves_other_type_bits() {
     let mut proc = new_processor();
 
-    // 0x1D = PCM(0x01) | PIC(0x04) | META(0x08) | POS(0x10)
+    // 0x1D = PCM(0x01) | POS(0x04) | META(0x08) | PIC(0x10)
     let mut h = header(0x1D, 100, 50, 300, 5000);
     proc.strip(&mut h);
 
-    // After strip: PCM(0x01) | POS(0x10) = 0x11
-    assert_eq!(h.type_mask, 0x11);
+    // After strip: PCM(0x01) | POS(0x04) = 0x05
+    assert_eq!(h.type_mask, 0x05);
 }
 
 fn pos_now(state: PlayState) -> PlaybackPosition {
@@ -272,28 +272,15 @@ fn decide_pos_passthrough_when_no_position() {
 }
 
 #[test]
-fn decide_pos_inject_on_cadence_tick() {
-    let mut proc = new_processor();
-    proc.frame_count = 20;
-    proc.last_pos_state = Some(PlayState::Playing);
-    let p = pos_now(PlayState::Playing);
-    assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Inject);
-}
-
-#[test]
-fn decide_pos_passthrough_between_cadence_ticks() {
-    let mut proc = new_processor();
-    proc.frame_count = 11;
-    proc.last_pos_state = Some(PlayState::Playing);
-    let p = pos_now(PlayState::Playing);
-    assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Passthrough);
+fn decide_pos_passthrough_when_no_position_data() {
+    let proc = new_processor();
+    assert_eq!(proc.decide_pos_action(None), PosAction::Passthrough);
 }
 
 #[test]
 fn decide_pos_inject_on_first_sight() {
     let mut proc = new_processor();
     proc.frame_count = 1;
-    assert!(proc.last_pos_state.is_none());
     let p = pos_now(PlayState::Playing);
     assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Inject);
 }
@@ -308,11 +295,21 @@ fn decide_pos_inject_on_state_transition() {
 }
 
 #[test]
-fn decide_pos_paused_mid_cadence_passthrough() {
+fn decide_pos_inject_on_cadence_tick() {
+    // HQPlayer emits POS every ~10 frames; we match.
+    let mut proc = new_processor();
+    proc.frame_count = 10;
+    proc.last_pos_state = Some(PlayState::Playing);
+    let p = pos_now(PlayState::Playing);
+    assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Inject);
+}
+
+#[test]
+fn decide_pos_passthrough_between_cadence_ticks() {
     let mut proc = new_processor();
     proc.frame_count = 7;
-    proc.last_pos_state = Some(PlayState::Paused);
-    let p = pos_now(PlayState::Paused);
+    proc.last_pos_state = Some(PlayState::Playing);
+    let p = pos_now(PlayState::Playing);
     assert_eq!(proc.decide_pos_action(Some(&p)), PosAction::Passthrough);
 }
 

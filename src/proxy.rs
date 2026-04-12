@@ -204,11 +204,18 @@ impl FrameProcessor {
 
     /// Pure decision: given current playback position, decide whether to inject
     /// a new [position] section this frame.
+    ///
+    /// HQPlayer's own NAA output emits POS every ~10 audio frames (verified
+    /// 2026-04-12 via capture_proxy on einstein: mean gap 10.9 frames across
+    /// 17 POS sections, ~2.33s wall-clock at 81920 samples/frame × 384kHz).
+    /// Matching that cadence is the "mimic HQPlayer exactly" rule — T8 is
+    /// tuned to that rate. Also inject immediately on first sight and on
+    /// state transitions so the display catches up promptly.
     pub(crate) fn decide_pos_action(
         &self,
         pos: Option<&crate::metadata::PlaybackPosition>,
     ) -> PosAction {
-        const POS_CADENCE_FRAMES: u64 = 20;
+        const POS_CADENCE_FRAMES: u64 = 10;
 
         let Some(pos) = pos else {
             return PosAction::Passthrough;
@@ -217,15 +224,12 @@ impl FrameProcessor {
         if self.last_pos_state.is_none() {
             return PosAction::Inject;
         }
-
         if self.last_pos_state != Some(pos.state) {
             return PosAction::Inject;
         }
-
         if self.frame_count % POS_CADENCE_FRAMES == 0 {
             return PosAction::Inject;
         }
-
         PosAction::Passthrough
     }
 
@@ -293,6 +297,12 @@ impl FrameProcessor {
             PosAction::Inject => {
                 let pos = pos_ref.expect("decide_pos_action returned Inject only when Some");
                 let bytes = build_pos_section(pos, std::time::Instant::now());
+                if self.last_pos_state.is_none() {
+                    eprintln!(
+                        "{} [POS] first inject: len={} state={:?} pos={} length={}",
+                        ts(), bytes.len(), pos.state, pos.position_seconds, pos.length_seconds,
+                    );
+                }
                 header.pos_len = bytes.len() as u32;
                 header.type_mask |= TYPE_POS;
                 self.last_pos_state = Some(pos.state);

@@ -2,9 +2,13 @@ use crate::metadata::{PlayState, PlaybackPosition};
 use std::time::Instant;
 
 pub const FRAME_HEADER_SIZE: usize = 32;
-pub const TYPE_PIC: u32 = 0x04;
+// type_mask bits — verified against HQPlayer's own emission (capture_proxy.py,
+// /tmp/naa_capture, 2026-04-12). Frame 35 had type_mask=0x05 with only
+// pos_len non-zero, proving 0x04 = POS. Frame 1 had all sections and the
+// remaining high bit was 0x10, proving 0x10 = PIC.
+pub const TYPE_POS: u32 = 0x04;
 pub const TYPE_META: u32 = 0x08;
-pub const TYPE_POS: u32 = 0x10;
+pub const TYPE_PIC: u32 = 0x10;
 
 #[derive(Debug)]
 pub struct FrameHeader {
