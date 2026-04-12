@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
@@ -7,6 +8,56 @@ use crate::frame::{
 };
 use crate::metadata::{Metadata, SharedMetadata};
 use crate::ts;
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum FrameOp {
+    /// Stream N bytes from src to dst.
+    Pass(usize),
+    /// Emit bytes to dst immediately (no src interaction).
+    Emit(Vec<u8>),
+    /// Discard N bytes from src.
+    Skip(usize),
+}
+
+/// Drain ops against a data slice. Returns when either the queue is empty
+/// or the head op can't be fully satisfied by the remaining source bytes
+/// (in which case the head op is left with a reduced count).
+pub(crate) fn execute_ops(
+    ops: &mut VecDeque<FrameOp>,
+    data: &[u8],
+    pos: &mut usize,
+    out: &mut Vec<u8>,
+) {
+    while let Some(op) = ops.front_mut() {
+        match op {
+            FrameOp::Pass(n) => {
+                let take = (*n).min(data.len() - *pos);
+                out.extend_from_slice(&data[*pos..*pos + take]);
+                *pos += take;
+                *n -= take;
+                if *n == 0 {
+                    ops.pop_front();
+                } else {
+                    return;
+                }
+            }
+            FrameOp::Skip(n) => {
+                let take = (*n).min(data.len() - *pos);
+                *pos += take;
+                *n -= take;
+                if *n == 0 {
+                    ops.pop_front();
+                } else {
+                    return;
+                }
+            }
+            FrameOp::Emit(bytes) => {
+                out.extend_from_slice(bytes);
+                ops.pop_front();
+            }
+        }
+    }
+}
 
 /// Forward NAA->HQP: simple byte passthrough with XML logging.
 pub fn forward_passthrough(mut src: TcpStream, mut dst: TcpStream, label: &str) {
