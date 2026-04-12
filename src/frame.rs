@@ -141,6 +141,7 @@ use std::time::Instant;
 /// Format: `[position]\n` + `key=value\n` lines + `\0`.
 /// 13 fields in HQPlayer's emitted order — unknown or reordered fields
 /// cause the T8's whitelist parser to reject the whole section.
+#[allow(dead_code)]
 pub fn build_pos_section(pos: &PlaybackPosition, now: Instant) -> Vec<u8> {
     use std::io::Write;
 
