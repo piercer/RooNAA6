@@ -1,12 +1,14 @@
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlayState {
     Playing,
     Paused,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct PlaybackPosition {
     pub length_seconds: u32,
