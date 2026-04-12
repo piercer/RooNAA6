@@ -1,6 +1,7 @@
 *.iml
 .idea/
 target/
+.worktrees/
 __pycache__/
 *.log
 config.toml
