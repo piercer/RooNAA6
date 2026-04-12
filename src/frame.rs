@@ -1,3 +1,6 @@
+use crate::metadata::{PlayState, PlaybackPosition};
+use std::time::Instant;
+
 pub const FRAME_HEADER_SIZE: usize = 32;
 pub const TYPE_PIC: u32 = 0x04;
 pub const TYPE_META: u32 = 0x08;
@@ -133,13 +136,10 @@ pub fn is_corrupt(header: &FrameHeader) -> bool {
         || header.pic_len > 1_000_000
 }
 
-use crate::metadata::{PlayState, PlaybackPosition};
-use std::time::Instant;
-
 /// Build a NAA `[position]` section matching HQPlayer's byte layout.
 ///
 /// Format: `[position]\n` + `key=value\n` lines + `\0`.
-/// 13 fields in HQPlayer's emitted order — unknown or reordered fields
+/// 16 fields in HQPlayer's emitted order — unknown or reordered fields
 /// cause the T8's whitelist parser to reject the whole section.
 #[allow(dead_code)]
 pub fn build_pos_section(pos: &PlaybackPosition, now: Instant) -> Vec<u8> {

@@ -22,7 +22,7 @@ fn ends_with_null_terminator() {
 }
 
 #[test]
-fn contains_all_thirteen_fields_in_order() {
+fn contains_all_sixteen_fields_in_order() {
     let p = position(PlayState::Playing, 225, 11.0, Instant::now());
     let section = build_pos_section(&p, Instant::now());
     let text = std::str::from_utf8(&section[..section.len() - 1]).unwrap();
