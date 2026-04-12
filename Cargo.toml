@@ -1,6 +1,6 @@
 [package]
 name = "RooNAA6"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "NAA v6 metadata-injecting proxy for HQPlayer → NAA endpoint"
 license-file = "LICENSE"
