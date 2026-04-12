@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC, TYPE_POS};
 use crate::metadata::{Metadata, PlayState, SharedMetadata};
-use crate::proxy::{FrameOp, FrameProcessor};
+use crate::proxy::{FrameOp, FrameProcessor, META_REFRESH_FRAMES};
 
 const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
 const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
@@ -45,6 +45,7 @@ fn new_defaults() {
 fn reset_for_start_clears_all_keys() {
     let mut proc = FrameProcessor::new(SharedMetadata::new());
     proc.last_meta_key = Some(("t".into(), "a".into(), "b".into()));
+    proc.last_meta_frame = 450;
     proc.last_pos_key = Some((225, 10, PlayState::Playing));
     proc.frame_count = 500;
     proc.ops.push_back(FrameOp::Pass(100));
@@ -53,6 +54,7 @@ fn reset_for_start_clears_all_keys() {
     proc.reset_for_start(DSD);
 
     assert!(proc.last_meta_key.is_none());
+    assert_eq!(proc.last_meta_frame, 0);
     assert!(proc.last_pos_key.is_none());
     assert_eq!(proc.frame_count, 0);
     assert_eq!(proc.params, DSD);
@@ -110,16 +112,21 @@ fn emits_meta_on_first_sight_when_title_known() {
 
     let ops: Vec<_> = proc.ops.iter().collect();
     assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    // Two emits: meta section then cover bytes.
     assert!(matches!(ops[1], FrameOp::Emit(_)));
+    assert!(matches!(ops[2], FrameOp::Emit(_)));
 }
 
 #[test]
-fn skips_hqp_meta_when_key_unchanged() {
+fn skips_hqp_meta_when_key_unchanged_mid_cadence() {
     let shared = SharedMetadata::new();
     seed_track(&shared, "Song", None);
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
     proc.last_meta_key = Some(("Song".into(), "Artist".into(), "Album".into()));
+    // Mid-cadence: a handful of frames since last emission.
+    proc.frame_count = 50;
+    proc.last_meta_frame = 10;
 
     // HQP sent META bytes — must be stripped, no replacement emitted.
     let mut h = header(0x01 | TYPE_META, 100, 0, 250, 0);
@@ -138,23 +145,65 @@ fn skips_hqp_meta_when_key_unchanged() {
 }
 
 #[test]
-fn emits_new_meta_on_track_change() {
+fn refreshes_meta_text_without_cover_on_cadence() {
+    let shared = SharedMetadata::new();
+    seed_track(&shared, "Song", Some(&vec![0xFFu8; 40000]));
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.last_meta_key = Some(("Song".into(), "Artist".into(), "Album".into()));
+    proc.frame_count = META_REFRESH_FRAMES + 1;
+    proc.last_meta_frame = 1;
+
+    let mut h = header(0x01, 100, 0, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    // META re-emitted, but cover NOT re-sent on refresh.
+    assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_eq!(h.type_mask & TYPE_PIC, 0);
+    assert_eq!(h.pic_len, 0);
+    assert!(h.meta_len > 0);
+    assert_eq!(proc.last_meta_frame, META_REFRESH_FRAMES + 1);
+
+    let emits = proc.ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
+    assert_eq!(emits, 1, "refresh should emit only meta text, not cover");
+}
+
+#[test]
+fn emits_new_meta_with_cover_on_track_change() {
     let shared = SharedMetadata::new();
     seed_track(&shared, "New Song", Some(&[0xFF, 0xD8]));
     let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
     proc.last_meta_key = Some(("Old Song".into(), "Artist".into(), "Album".into()));
+    // Mid-cadence so only the content change triggers emission.
+    proc.frame_count = 50;
+    proc.last_meta_frame = 10;
 
     let mut h = header(0x01, 100, 0, 0, 0);
     proc.build_frame_ops(&mut h);
 
     assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_ne!(h.type_mask & TYPE_PIC, 0);
+    assert_eq!(h.pic_len, 2);
     assert_eq!(
         proc.last_meta_key,
         Some(("New Song".into(), "Artist".into(), "Album".into()))
     );
-    let ops: Vec<_> = proc.ops.iter().collect();
-    assert!(matches!(ops[ops.len() - 1], FrameOp::Emit(_)));
+    let emits = proc.ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
+    assert_eq!(emits, 2, "content change should emit meta + cover");
+}
+
+fn find_meta_emit<'a>(proc: &'a FrameProcessor) -> &'a [u8] {
+    // The META section Emit is the first one whose bytes start with the
+    // `[metadata]` header — always present when emission occurred.
+    for op in proc.ops.iter() {
+        if let FrameOp::Emit(b) = op {
+            if b.starts_with(b"[metadata]") {
+                return b;
+            }
+        }
+    }
+    panic!("no meta section Emit in ops: {:?}", proc.ops);
 }
 
 #[test]
@@ -172,12 +221,8 @@ fn meta_payload_contains_track_fields() {
     let mut h = header(0x01, 100, 0, 0, 0);
     proc.build_frame_ops(&mut h);
 
-    let ops: Vec<_> = proc.ops.iter().collect();
-    let payload = match ops.last().unwrap() {
-        FrameOp::Emit(b) => b,
-        _ => panic!("expected trailing Emit"),
-    };
-    let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
+    let section = find_meta_emit(&proc);
+    let text = std::str::from_utf8(&section[..section.len() - 1]).unwrap();
     assert!(text.contains("song=My Song\n"));
     assert!(text.contains("artist=My Artist\n"));
     assert!(text.contains("album=My Album\n"));
@@ -194,20 +239,16 @@ fn meta_payload_uses_dsd_base_rate() {
     let mut h = header(0x01, 100, 0, 0, 0);
     proc.build_frame_ops(&mut h);
 
-    let payload = match proc.ops.iter().last().unwrap() {
-        FrameOp::Emit(b) => b.clone(),
-        _ => panic!(),
-    };
-    let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
+    let section = find_meta_emit(&proc);
+    let text = std::str::from_utf8(&section[..section.len() - 1]).unwrap();
     assert!(text.contains("samplerate=2822400\n"));
     assert!(text.contains("sdm=1\n"));
 }
 
 #[test]
 fn meta_header_len_excludes_jpeg() {
-    // meta_len in the header must only cover the [metadata] section,
-    // pic_len covers the JPEG. They share the payload bytes but are
-    // advertised separately.
+    // meta_len advertises only the [metadata] section size; pic_len covers
+    // the JPEG. The two Emits are separate ops on the wire.
     let shared = SharedMetadata::new();
     let jpeg = vec![0xFFu8; 1234];
     seed_track(&shared, "Song", Some(&jpeg));
@@ -372,6 +413,7 @@ fn emits_both_slots_when_both_keys_change() {
     assert_ne!(h.type_mask & TYPE_META, 0);
     assert_ne!(h.type_mask & TYPE_PIC, 0);
 
+    // Three emits: pos section + meta section + cover bytes.
     let emits = proc.ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
-    assert_eq!(emits, 2);
+    assert_eq!(emits, 3);
 }
