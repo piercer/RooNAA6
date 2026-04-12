@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC};
-use crate::metadata::{Metadata, SharedMetadata};
-use crate::proxy::{Action, FrameProcessor, Phase};
+use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC, TYPE_POS};
+use crate::metadata::{Metadata, PlayState, SharedMetadata};
+use crate::proxy::{FrameOp, FrameProcessor};
 
 const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
 const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
@@ -11,246 +11,382 @@ fn header(type_mask: u32, pcm_len: u32, pos_len: u32, meta_len: u32, pic_len: u3
     FrameHeader { raw: [0u8; FRAME_HEADER_SIZE], type_mask, pcm_len, pos_len, meta_len, pic_len }
 }
 
-fn meta(title: &str, artist: &str, album: &str, cover: Option<&[u8]>) -> Metadata {
-    Metadata {
-        title: title.to_string(),
-        artist: artist.to_string(),
-        album: album.to_string(),
+fn seed_track(shared: &SharedMetadata, title: &str, cover: Option<&[u8]>) {
+    shared.set(Metadata {
+        title: title.into(),
+        artist: "Artist".into(),
+        album: "Album".into(),
         cover_art: cover.map(|c| Arc::new(c.to_vec())),
-    }
+        ..Metadata::default()
+    });
 }
 
-fn new_processor() -> FrameProcessor {
-    FrameProcessor::new(SharedMetadata::new())
+fn seed_position(shared: &SharedMetadata, length: u32, seek: f64, state: PlayState) {
+    let mut m = shared.get();
+    m.length_seconds = Some(length);
+    m.seek_position = Some(seek);
+    m.play_state = Some(state);
+    m.tracks_total = 5;
+    shared.set(m);
 }
 
 #[test]
 fn new_defaults() {
-    let proc = new_processor();
-    assert_eq!(proc.phase, Phase::Header);
+    let proc = FrameProcessor::new(SharedMetadata::new());
+    assert!(proc.ops.is_empty());
     assert_eq!(proc.frame_count, 0);
-    assert!(!proc.injected);
-    assert!(proc.last_title.is_none());
-    assert!(proc.pending_inject.is_none());
-    assert_eq!(proc.pass_remaining, 0);
-    assert_eq!(proc.skip_remaining, 0);
-    assert!(!proc.strip_logged);
+    assert!(proc.last_meta_key.is_none());
+    assert!(proc.last_pos_key.is_none());
     assert_eq!(proc.params.bits, 32);
     assert!(!proc.params.is_dsd);
 }
 
 #[test]
-fn reset_clears_state() {
-    let mut proc = new_processor();
-    proc.injected = true;
-    proc.last_title = Some("Old Song".into());
+fn reset_for_start_clears_all_keys() {
+    let mut proc = FrameProcessor::new(SharedMetadata::new());
+    proc.last_meta_key = Some(("t".into(), "a".into(), "b".into()));
+    proc.last_pos_key = Some((225, 10, PlayState::Playing));
     proc.frame_count = 500;
-    proc.strip_logged = true;
-    proc.phase = Phase::Skip;
-    proc.pass_remaining = 1000;
-    proc.skip_remaining = 200;
-    proc.pending_inject = Some(vec![1, 2, 3]);
+    proc.ops.push_back(FrameOp::Pass(100));
     proc.header_buf.extend_from_slice(&[0u8; 16]);
 
     proc.reset_for_start(DSD);
 
-    assert_eq!(proc.phase, Phase::Header);
-    assert!(!proc.injected);
-    assert!(proc.last_title.is_none());
+    assert!(proc.last_meta_key.is_none());
+    assert!(proc.last_pos_key.is_none());
     assert_eq!(proc.frame_count, 0);
-    assert!(!proc.strip_logged);
-    assert!(proc.header_buf.is_empty());
-    assert_eq!(proc.pass_remaining, 0);
-    assert_eq!(proc.skip_remaining, 0);
-    assert!(proc.pending_inject.is_none());
     assert_eq!(proc.params, DSD);
+    assert!(proc.ops.is_empty());
+    assert!(proc.header_buf.is_empty());
 }
 
+// --- META/PIC: strip-always + event-driven ---
+
 #[test]
-fn inject_with_cover() {
-    let mut proc = new_processor();
+fn strips_hqp_meta_when_no_roon_title_yet() {
+    // HQPlayer sent META/PIC (fallback "Roon") but Roon state is empty.
+    // Proxy must unconditionally strip, emitting nothing.
+    let shared = SharedMetadata::new();
+    let mut proc = FrameProcessor::new(shared);
     proc.params = PCM;
 
-    let fake_jpeg = vec![0xFF, 0xD8, 0x00, 0x01];
-    let m = meta("Title", "Artist", "Album", Some(&fake_jpeg));
-    let mut h = header(0x01, 100, 50, 0, 0);
-
-    let jpeg_len = proc.inject(&mut h, &m, true);
-
-    assert_eq!(jpeg_len, 4);
-    assert_ne!(h.type_mask & TYPE_META, 0);
-    assert_ne!(h.type_mask & TYPE_PIC, 0);
-    assert_ne!(h.meta_len, 0);
-    assert_eq!(h.pic_len, 4);
-    assert_eq!(proc.last_title.as_deref(), Some("Title"));
-
-    let payload = proc.pending_inject.unwrap();
-    assert!(payload.ends_with(&fake_jpeg));
-}
-
-#[test]
-fn inject_without_cover() {
-    let mut proc = new_processor();
-    proc.params = PCM;
-
-    let m = meta("Title", "Artist", "Album", Some(&[0xFF, 0xD8]));
-    let mut h = header(0x01, 100, 50, 0, 0);
-
-    let jpeg_len = proc.inject(&mut h, &m, false);
-
-    assert_eq!(jpeg_len, 0);
-    assert_ne!(h.type_mask & TYPE_META, 0);
-    assert_eq!(h.type_mask & TYPE_PIC, 0);
-    assert_eq!(h.pic_len, 0);
-
-    let payload = proc.pending_inject.unwrap();
-    assert!(!payload.windows(2).any(|w| w == [0xFF, 0xD8]));
-}
-
-#[test]
-fn inject_no_cover_art_available() {
-    let mut proc = new_processor();
-    proc.params = PCM;
-
-    let m = meta("Title", "Artist", "Album", None);
-    let mut h = header(0x01, 100, 50, 0, 0);
-
-    let jpeg_len = proc.inject(&mut h, &m, true);
-
-    assert_eq!(jpeg_len, 0);
-    assert_ne!(h.type_mask & TYPE_META, 0);
-    assert_eq!(h.type_mask & TYPE_PIC, 0);
-    assert_eq!(h.pic_len, 0);
-}
-
-#[test]
-fn inject_meta_section_content() {
-    let mut proc = new_processor();
-    proc.params = PCM;
-
-    let m = meta("My Song", "My Artist", "My Album", None);
-    let mut h = header(0x09, 100, 50, 200, 0);
-
-    proc.inject(&mut h, &m, false);
-
-    let payload = proc.pending_inject.unwrap();
-    let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
-    assert!(text.starts_with("[metadata]\n"));
-    assert!(text.contains("song=My Song\n"));
-    assert!(text.contains("artist=My Artist\n"));
-    assert!(text.contains("album=My Album\n"));
-    assert!(text.contains("samplerate=44100\n"));
-    assert!(text.contains("sdm=0\n"));
-}
-
-#[test]
-fn inject_dsd_uses_base_rate() {
-    let mut proc = new_processor();
-    proc.params = DSD;
-
-    let m = meta("DSD Track", "Artist", "Album", None);
-    let mut h = header(0x09, 100, 50, 200, 0);
-
-    proc.inject(&mut h, &m, false);
-
-    let payload = proc.pending_inject.unwrap();
-    let text = std::str::from_utf8(&payload[..payload.len() - 1]).unwrap();
-    assert!(text.contains("samplerate=2822400\n"));
-    assert!(text.contains("sdm=1\n"));
-    assert!(text.contains("bits=1\n"));
-}
-
-#[test]
-fn strip_clears_meta_and_pic() {
-    let mut proc = new_processor();
-    proc.pending_inject = Some(vec![1, 2, 3]);
-
-    let mut h = header(0x0D, 100, 50, 300, 5000);
-    proc.strip(&mut h);
+    let mut h = header(0x01 | TYPE_META | TYPE_PIC, 100, 0, 200, 5000);
+    proc.build_frame_ops(&mut h);
 
     assert_eq!(h.type_mask & TYPE_META, 0);
     assert_eq!(h.type_mask & TYPE_PIC, 0);
     assert_eq!(h.meta_len, 0);
     assert_eq!(h.pic_len, 0);
-    assert!(proc.pending_inject.is_none());
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Skip(n) if *n == 200 + 5000));
+    assert_eq!(
+        ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count(),
+        0,
+    );
+    assert!(proc.last_meta_key.is_none());
 }
 
 #[test]
-fn decide_strip_when_hqp_meta_arrives_before_roon_title() {
-    // Bug: HQPlayer's first META frame arrives before Roon WebSocket delivers
-    // now_playing. Previously this fell through to PASSTHROUGH and HQP's
-    // original title ("Roon") reached the T8.
-    let proc = new_processor();
-    assert!(!proc.injected);
+fn emits_meta_on_first_sight_when_title_known() {
+    let shared = SharedMetadata::new();
+    seed_track(&shared, "Song", Some(&[0xFF, 0xD8, 0xAA, 0xBB]));
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
 
-    let action = proc.decide_action(/* has_meta */ true, /* title */ "");
+    // Audio-only frame (no HQP META bit).
+    let mut h = header(0x01, 100, 0, 0, 0);
+    proc.build_frame_ops(&mut h);
 
-    assert_eq!(action, Action::Strip);
+    assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_ne!(h.type_mask & TYPE_PIC, 0);
+    assert_eq!(h.pic_len, 4);
+    assert!(h.meta_len > 0);
+    assert_eq!(
+        proc.last_meta_key,
+        Some(("Song".into(), "Artist".into(), "Album".into()))
+    );
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    // Two emits: meta section then cover bytes.
+    assert!(matches!(ops[1], FrameOp::Emit(_)));
+    assert!(matches!(ops[2], FrameOp::Emit(_)));
 }
 
 #[test]
-fn decide_inject_first_meta_frame_with_title() {
-    let proc = new_processor();
-    assert_eq!(proc.decide_action(true, "Song"), Action::Inject);
+fn reemits_meta_every_frame_without_cover_when_key_unchanged() {
+    // META text is re-sent on every frame once the title is known,
+    // so the T8 never reverts to HQPlayer's "Roon" fallback. Cover
+    // stays strictly change-driven — no re-send while the key holds.
+    let shared = SharedMetadata::new();
+    seed_track(&shared, "Song", Some(&vec![0xFFu8; 40000]));
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.last_meta_key = Some(("Song".into(), "Artist".into(), "Album".into()));
+    proc.frame_count = 50;
+
+    // HQP sent META bytes — must be stripped, and replaced with ours.
+    let mut h = header(0x01 | TYPE_META, 100, 0, 250, 0);
+    proc.build_frame_ops(&mut h);
+
+    assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_eq!(h.type_mask & TYPE_PIC, 0);
+    assert_eq!(h.pic_len, 0);
+    assert!(h.meta_len > 0);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Skip(250)));
+    let emits = ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
+    assert_eq!(emits, 1, "re-emit meta text only, no cover");
 }
 
 #[test]
-fn decide_passthrough_audio_frame_no_title() {
-    let proc = new_processor();
-    assert_eq!(proc.decide_action(false, ""), Action::Passthrough);
+fn emits_new_meta_with_cover_on_track_change() {
+    let shared = SharedMetadata::new();
+    seed_track(&shared, "New Song", Some(&[0xFF, 0xD8]));
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.last_meta_key = Some(("Old Song".into(), "Artist".into(), "Album".into()));
+    proc.frame_count = 50;
+
+    let mut h = header(0x01, 100, 0, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_ne!(h.type_mask & TYPE_PIC, 0);
+    assert_eq!(h.pic_len, 2);
+    assert_eq!(
+        proc.last_meta_key,
+        Some(("New Song".into(), "Artist".into(), "Album".into()))
+    );
+    let emits = proc.ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
+    assert_eq!(emits, 2, "content change should emit meta + cover");
+}
+
+fn find_meta_emit<'a>(proc: &'a FrameProcessor) -> &'a [u8] {
+    // The META section Emit is the first one whose bytes start with the
+    // `[metadata]` header — always present when emission occurred.
+    for op in proc.ops.iter() {
+        if let FrameOp::Emit(b) = op {
+            if b.starts_with(b"[metadata]") {
+                return b;
+            }
+        }
+    }
+    panic!("no meta section Emit in ops: {:?}", proc.ops);
 }
 
 #[test]
-fn decide_inject_on_audio_frame_when_title_arrives_late() {
-    // Title arrived after HQPlayer's META was already stripped.
-    // We must inject on the next audio frame — there won't be another META.
-    let proc = new_processor();
-    assert_eq!(proc.decide_action(false, "Song"), Action::Inject);
+fn meta_payload_contains_track_fields() {
+    let shared = SharedMetadata::new();
+    shared.set(Metadata {
+        title: "My Song".into(),
+        artist: "My Artist".into(),
+        album: "My Album".into(),
+        ..Metadata::default()
+    });
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+
+    let mut h = header(0x01, 100, 0, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    let section = find_meta_emit(&proc);
+    let text = std::str::from_utf8(&section[..section.len() - 1]).unwrap();
+    assert!(text.contains("song=My Song\n"));
+    assert!(text.contains("artist=My Artist\n"));
+    assert!(text.contains("album=My Album\n"));
+    assert!(text.contains("samplerate=44100\n"));
 }
 
 #[test]
-fn decide_gapless_on_track_change() {
-    let mut proc = new_processor();
-    proc.injected = true;
-    proc.last_title = Some("Old".into());
-    assert_eq!(proc.decide_action(false, "New"), Action::Gapless);
-    assert_eq!(proc.decide_action(true, "New"), Action::Gapless);
+fn meta_payload_uses_dsd_base_rate() {
+    let shared = SharedMetadata::new();
+    seed_track(&shared, "DSD Track", None);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = DSD;
+
+    let mut h = header(0x01, 100, 0, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    let section = find_meta_emit(&proc);
+    let text = std::str::from_utf8(&section[..section.len() - 1]).unwrap();
+    assert!(text.contains("samplerate=2822400\n"));
+    assert!(text.contains("sdm=1\n"));
 }
 
 #[test]
-fn decide_strip_refresh_after_inject() {
-    let mut proc = new_processor();
-    proc.injected = true;
-    proc.last_title = Some("Song".into());
-    assert_eq!(proc.decide_action(true, "Song"), Action::Strip);
+fn meta_header_len_excludes_jpeg() {
+    // meta_len advertises only the [metadata] section size; pic_len covers
+    // the JPEG. The two Emits are separate ops on the wire.
+    let shared = SharedMetadata::new();
+    let jpeg = vec![0xFFu8; 1234];
+    seed_track(&shared, "Song", Some(&jpeg));
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+
+    let mut h = header(0x01, 100, 0, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    assert_eq!(h.pic_len, 1234);
+    assert!(h.meta_len > 0);
+    assert!(h.meta_len < 500, "meta_len should not include jpeg bytes");
+}
+
+// --- POS: strip-always + event-driven ---
+
+#[test]
+fn emits_pos_on_first_sight() {
+    let shared = SharedMetadata::new();
+    seed_position(&shared, 225, 10.0, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+
+    let mut h = header(0x01 | TYPE_POS, 100, 50, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Skip(50)));
+    assert!(matches!(ops[2], FrameOp::Emit(_)));
+    assert!(h.pos_len > 0);
+    assert_ne!(h.type_mask & TYPE_POS, 0);
+    assert_eq!(proc.last_pos_key, Some((225, 10, PlayState::Playing)));
 }
 
 #[test]
-fn decide_refresh_every_300_frames() {
-    let mut proc = new_processor();
-    proc.injected = true;
-    proc.last_title = Some("Song".into());
-    proc.frame_count = 300;
-    assert_eq!(proc.decide_action(false, "Song"), Action::Refresh);
+fn strips_hqp_pos_when_no_shared_position() {
+    let shared = SharedMetadata::new();
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+
+    let mut h = header(0x01 | TYPE_POS, 100, 50, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Skip(50)));
+    assert!(proc.last_pos_key.is_none());
+    assert_eq!(h.pos_len, 0);
+    assert_eq!(h.type_mask & TYPE_POS, 0);
 }
 
 #[test]
-fn decide_passthrough_between_refreshes() {
-    let mut proc = new_processor();
-    proc.injected = true;
-    proc.last_title = Some("Song".into());
-    proc.frame_count = 150;
-    assert_eq!(proc.decide_action(false, "Song"), Action::Passthrough);
+fn skips_hqp_pos_when_key_unchanged() {
+    let shared = SharedMetadata::new();
+    seed_position(&shared, 225, 10.0, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.last_pos_key = Some((225, 10, PlayState::Playing));
+
+    let mut h = header(0x01 | TYPE_POS, 100, 50, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    assert!(matches!(ops[1], FrameOp::Skip(50)));
+    assert_eq!(
+        ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count(),
+        0,
+    );
+    assert_eq!(h.pos_len, 0);
+    assert_eq!(h.type_mask & TYPE_POS, 0);
 }
 
 #[test]
-fn strip_preserves_other_type_bits() {
-    let mut proc = new_processor();
+fn emits_pos_on_state_change() {
+    let shared = SharedMetadata::new();
+    seed_position(&shared, 225, 10.0, PlayState::Paused);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.last_pos_key = Some((225, 10, PlayState::Playing));
 
-    // 0x1D = PCM(0x01) | PIC(0x04) | META(0x08) | POS(0x10)
-    let mut h = header(0x1D, 100, 50, 300, 5000);
-    proc.strip(&mut h);
+    let mut h = header(0x01 | TYPE_POS, 100, 50, 0, 0);
+    proc.build_frame_ops(&mut h);
 
-    // After strip: PCM(0x01) | POS(0x10) = 0x11
-    assert_eq!(h.type_mask, 0x11);
+    assert_eq!(proc.last_pos_key, Some((225, 10, PlayState::Paused)));
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(ops.iter().any(|op| matches!(op, FrameOp::Emit(_))));
+}
+
+#[test]
+fn emits_pos_on_seek_change() {
+    let shared = SharedMetadata::new();
+    seed_position(&shared, 225, 42.0, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+    proc.last_pos_key = Some((225, 10, PlayState::Playing));
+
+    let mut h = header(0x01 | TYPE_POS, 100, 50, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    assert_eq!(proc.last_pos_key, Some((225, 42, PlayState::Playing)));
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(ops.iter().any(|op| matches!(op, FrameOp::Emit(_))));
+}
+
+#[test]
+fn no_orig_pos_section_still_emits_when_needed() {
+    let shared = SharedMetadata::new();
+    seed_position(&shared, 225, 10.0, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+
+    let mut h = header(0x01, 100, 0, 0, 0);
+    proc.build_frame_ops(&mut h);
+
+    let ops: Vec<_> = proc.ops.iter().collect();
+    assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
+    // No Skip(orig_pos) because orig_pos_len == 0.
+    assert!(matches!(ops[1], FrameOp::Emit(_)));
+    assert!(h.pos_len > 0);
+}
+
+// --- Combined: both slots owned uniformly ---
+
+#[test]
+fn strips_all_owned_sections_uniformly() {
+    // A frame carrying HQP's POS, META, and PIC with no Roon state.
+    // All three must be stripped; type_mask should retain only PCM.
+    let shared = SharedMetadata::new();
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+
+    let mut h = header(
+        0x01 | TYPE_POS | TYPE_META | TYPE_PIC,
+        100,
+        50,
+        200,
+        1000,
+    );
+    proc.build_frame_ops(&mut h);
+
+    assert_eq!(h.type_mask, 0x01);
+    assert_eq!(h.pos_len, 0);
+    assert_eq!(h.meta_len, 0);
+    assert_eq!(h.pic_len, 0);
+}
+
+#[test]
+fn emits_both_slots_when_both_keys_change() {
+    let shared = SharedMetadata::new();
+    seed_track(&shared, "Song", Some(&[0xFF, 0xD8]));
+    seed_position(&shared, 225, 10.0, PlayState::Playing);
+    let mut proc = FrameProcessor::new(shared);
+    proc.params = PCM;
+
+    let mut h = header(0x01 | TYPE_POS | TYPE_META, 100, 50, 100, 0);
+    proc.build_frame_ops(&mut h);
+
+    // POS and META/PIC both emitted; header bits all set.
+    assert_ne!(h.type_mask & TYPE_POS, 0);
+    assert_ne!(h.type_mask & TYPE_META, 0);
+    assert_ne!(h.type_mask & TYPE_PIC, 0);
+
+    // Three emits: pos section + meta section + cover bytes.
+    let emits = proc.ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
+    assert_eq!(emits, 3);
 }

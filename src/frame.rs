@@ -1,6 +1,13 @@
+use crate::metadata::PlayState;
+
 pub const FRAME_HEADER_SIZE: usize = 32;
-pub const TYPE_PIC: u32 = 0x04;
+// type_mask bits — verified against HQPlayer's own emission (capture_proxy.py,
+// /tmp/naa_capture, 2026-04-12). Frame 35 had type_mask=0x05 with only
+// pos_len non-zero, proving 0x04 = POS. Frame 1 had all sections and the
+// remaining high bit was 0x10, proving 0x10 = PIC.
+pub const TYPE_POS: u32 = 0x04;
 pub const TYPE_META: u32 = 0x08;
+pub const TYPE_PIC: u32 = 0x10;
 
 #[derive(Debug)]
 pub struct FrameHeader {
@@ -19,12 +26,6 @@ impl PartialEq for FrameHeader {
             && self.pos_len == other.pos_len
             && self.meta_len == other.meta_len
             && self.pic_len == other.pic_len
-    }
-}
-
-impl FrameHeader {
-    pub fn has_meta(&self) -> bool {
-        self.type_mask & TYPE_META != 0
     }
 }
 
@@ -131,4 +132,63 @@ pub fn is_corrupt(header: &FrameHeader) -> bool {
         || header.pos_len > 10_000
         || header.meta_len > 100_000
         || header.pic_len > 1_000_000
+}
+
+/// Build a NAA `[position]` section matching HQPlayer's byte layout.
+///
+/// Format: `[position]\n` + `key=value\n` lines + `\0`.
+/// 16 fields in HQPlayer's emitted order — unknown or reordered fields
+/// cause the T8's whitelist parser to reject the whole section.
+pub fn build_pos_section(
+    length_seconds: u32,
+    seek_position: f64,
+    state: PlayState,
+    track: u32,
+    tracks_total: u32,
+) -> Vec<u8> {
+    use std::io::Write;
+
+    let length_f = f64::from(length_seconds);
+    let effective_pos = seek_position.clamp(0.0, length_f);
+
+    let total_min = length_seconds / 60;
+    let total_sec = length_seconds % 60;
+
+    let remain = (length_f - effective_pos).max(0.0) as u32;
+    let remain_min = remain / 60;
+    let remain_sec = remain % 60;
+
+    let begin = effective_pos as u32;
+    let begin_min = begin / 60;
+    let begin_sec = begin % 60;
+
+    let state_str = match state {
+        PlayState::Playing => "PLAYING",
+        PlayState::Paused => "PAUSED",
+    };
+
+    let mut section = Vec::with_capacity(320);
+    write!(
+        section,
+        "[position]\n\
+         apod=0\n\
+         begin_min={begin_min}\n\
+         begin_sec={begin_sec}\n\
+         clips=0\n\
+         correction=0\n\
+         input_fill=-1.00000000000000000\n\
+         length={length_f:.17}\n\
+         output_fill=0.00000000000000000\n\
+         position={effective_pos:.17}\n\
+         remain_min={remain_min}\n\
+         remain_sec={remain_sec}\n\
+         state={state_str}\n\
+         total_min={total_min}\n\
+         total_sec={total_sec}\n\
+         track={track}\n\
+         tracks_total={tracks_total}\n",
+    )
+    .unwrap();
+    section.push(0x00);
+    section
 }

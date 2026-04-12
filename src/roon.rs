@@ -7,7 +7,7 @@ use serde_json::Value;
 use tungstenite::{Message, WebSocket};
 
 use crate::config::RoonConfig;
-use crate::metadata::{Metadata, SharedMetadata};
+use crate::metadata::{PlayState, SharedMetadata};
 use crate::ts;
 
 pub fn run(shared: SharedMetadata, cfg: &RoonConfig) {
@@ -138,36 +138,115 @@ fn run_once(
                 if json_str(zone, "display_name") != Some(cfg.zone.as_str()) {
                     continue;
                 }
-                if let Some(np) = zone.get("now_playing") {
-                    let (title, artist, album) = extract_track_info(np);
-                    let image_key = json_str(np, "image_key").unwrap_or("").to_string();
-
-                    let mut cover_art = shared.get().cover_art;
-                    if !image_key.is_empty() && image_key != last_image_key {
-                        last_image_key = image_key.clone();
-                        cover_art =
-                            download_cover(&http_agent, &cfg.host, cfg.port, &image_key)
-                                .map(Arc::new);
-                    }
-
-                    eprintln!(
-                        "{} [roon] {} \u{2014} {} ({})",
-                        ts(), artist, title, album,
-                    );
-
-                    shared.set(Metadata {
-                        title,
-                        artist,
-                        album,
-                        cover_art,
-                    });
-                }
+                apply_zone_update(
+                    shared,
+                    zone,
+                    &http_agent,
+                    &cfg.host,
+                    cfg.port,
+                    &mut last_image_key,
+                );
             }
         }
+
+        apply_zones_seek(shared, &body);
     }
 }
 
-// --- Track info extraction ---
+/// Apply a full zone object to shared metadata. Does partial updates —
+/// each field is only touched if present on the zone body, so other
+/// events (zones_seek_changed, previous zones_changed) are never wiped.
+pub(crate) fn apply_zone_update(
+    shared: &SharedMetadata,
+    zone: &Value,
+    http_agent: &ureq::Agent,
+    host: &str,
+    port: u16,
+    last_image_key: &mut String,
+) {
+    let mut meta = shared.get();
+
+    if let Some(np) = zone.get("now_playing") {
+        let (title, artist, album) = extract_track_info(np);
+        meta.title = title;
+        meta.artist = artist;
+        meta.album = album;
+
+        if let Some(image_key) = json_str(np, "image_key") {
+            if !image_key.is_empty() && image_key != *last_image_key {
+                *last_image_key = image_key.to_string();
+                meta.cover_art = download_cover(http_agent, host, port, image_key).map(Arc::new);
+            }
+        }
+
+        if let Some(l) = np
+            .get("length")
+            .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i.max(0) as u64)))
+        {
+            meta.length_seconds = Some(l as u32);
+        }
+    }
+
+    if let Some(state_str) = zone.get("state").and_then(|v| v.as_str()) {
+        meta.play_state = match state_str {
+            "playing" | "loading" => Some(PlayState::Playing),
+            "paused" => Some(PlayState::Paused),
+            _ => None, // stopped / unknown
+        };
+    }
+
+    // seek_position is a zone-level field in the Roon Transport API; check
+    // now_playing as a fallback defensively.
+    let seek = zone
+        .get("seek_position")
+        .or_else(|| zone.get("now_playing").and_then(|np| np.get("seek_position")))
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)));
+    if let Some(s) = seek {
+        meta.seek_position = Some(s);
+    }
+
+    if let Some(r) = zone.get("queue_items_remaining").and_then(|v| v.as_u64()) {
+        meta.tracks_total = (r as u32) + 1;
+    } else if meta.tracks_total == 0 {
+        meta.tracks_total = 1;
+    }
+    if meta.track == 0 {
+        meta.track = 1;
+    }
+
+    eprintln!(
+        "{} [roon] {} \u{2014} {} ({}) len={:?} seek={:?} state={:?}",
+        ts(),
+        meta.artist,
+        meta.title,
+        meta.album,
+        meta.length_seconds,
+        meta.seek_position,
+        meta.play_state,
+    );
+
+    shared.set(meta);
+}
+
+/// Apply a `zones_seek_changed` body: update only `seek_position` on the
+/// shared metadata. No-op if the body has no entries or the entry lacks a
+/// seek_position field.
+pub(crate) fn apply_zones_seek(shared: &SharedMetadata, body: &Value) {
+    let Some(seeks) = body.get("zones_seek_changed").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let Some(entry) = seeks.first() else { return };
+    let Some(seek) = entry
+        .get("seek_position")
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+    else {
+        return;
+    };
+
+    let mut meta = shared.get();
+    meta.seek_position = Some(seek);
+    shared.set(meta);
+}
 
 fn extract_track_info(np: &Value) -> (String, String, String) {
     let three = np.get("three_line").unwrap_or(&Value::Null);
