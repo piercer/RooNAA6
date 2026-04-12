@@ -160,7 +160,7 @@ fn run_once(
                         artist,
                         album,
                         cover_art,
-                        position: None,
+                        position: extract_playback_position(zone, std::time::Instant::now()),
                     });
                 }
             }
@@ -169,6 +169,51 @@ fn run_once(
 }
 
 // --- Track info extraction ---
+
+/// Parse the `state`, `seek_position`, and `now_playing.length` fields from a
+/// zone object into a PlaybackPosition. Returns None if any required field is
+/// missing or if state is "stopped".
+pub(crate) fn extract_playback_position(
+    zone: &Value,
+    captured_at: std::time::Instant,
+) -> Option<crate::metadata::PlaybackPosition> {
+    use crate::metadata::{PlayState, PlaybackPosition};
+
+    let state_str = zone.get("state").and_then(|v| v.as_str())?;
+    let state = match state_str {
+        "playing" | "loading" => PlayState::Playing,
+        "paused" => PlayState::Paused,
+        _ => return None, // "stopped" and anything unknown
+    };
+
+    let seek_position = zone
+        .get("seek_position")
+        .and_then(|v| v.as_f64())
+        .or_else(|| zone.get("seek_position").and_then(|v| v.as_i64()).map(|i| i as f64))?;
+
+    let np = zone.get("now_playing")?;
+    let length = np
+        .get("length")
+        .and_then(|v| v.as_u64())
+        .or_else(|| np.get("length").and_then(|v| v.as_i64()).map(|i| i.max(0) as u64))?
+        as u32;
+
+    let tracks_total = zone
+        .get("queue_items_remaining")
+        .and_then(|v| v.as_u64())
+        .map(|r| (r as u32) + 1)
+        .unwrap_or(1);
+    let track = 1;
+
+    Some(PlaybackPosition {
+        length_seconds: length,
+        position_seconds: seek_position,
+        captured_at,
+        state,
+        track,
+        tracks_total,
+    })
+}
 
 fn extract_track_info(np: &Value) -> (String, String, String) {
     let three = np.get("three_line").unwrap_or(&Value::Null);
