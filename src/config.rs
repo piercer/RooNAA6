@@ -19,6 +19,9 @@ pub struct NaaConfig {
     pub version: Option<String>,
     /// NAA endpoint name to proxy (matched against discover responses).
     pub target: Option<String>,
+    /// HQPlayer host IP. Only needed when proxy runs on a different machine than HQP.
+    /// Enables the Status proxy to listen on 4321 directly (no iptables needed).
+    pub hqp_host: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]

@@ -153,21 +153,31 @@ fn main() {
 
     // Status proxy: intercepts HQPlayer's control channel (port 4321)
     // so we can rewrite song="Roon" with the actual track title.
-    // Requires iptables redirect: -t nat -A PREROUTING -s <naa_host> -p tcp --dport 4321 -j REDIRECT --to-port 14321
+    //
+    // Same machine as HQP:  listen 14321, upstream 127.0.0.1:4321 (needs iptables redirect)
+    // Different machine:    listen 4321,  upstream hqp_host:4321   (no iptables needed)
+    let (status_listen_port, status_upstream_host) = if cfg.iptables.is_some() {
+        (14321u16, "127.0.0.1".to_string())
+    } else if let Some(ref hqp) = cfg.naa.hqp_host {
+        (4321u16, hqp.clone())
+    } else {
+        (0u16, String::new())
+    };
+
+    if status_listen_port > 0 {
     let status_shared = shared.clone();
     std::thread::Builder::new()
         .name("status-proxy".into())
         .spawn(move || {
-            const STATUS_LISTEN_PORT: u16 = 14321;
             const HQP_CONTROL_PORT: u16 = 4321;
-            let listener = match std::net::TcpListener::bind(("0.0.0.0", STATUS_LISTEN_PORT)) {
+            let listener = match std::net::TcpListener::bind(("0.0.0.0", status_listen_port)) {
                 Ok(l) => l,
                 Err(e) => {
-                    eprintln!("{} Status proxy bind failed on :{}: {}", ts(), STATUS_LISTEN_PORT, e);
+                    eprintln!("{} Status proxy bind failed on :{}: {}", ts(), status_listen_port, e);
                     return;
                 }
             };
-            eprintln!("{} Status proxy: :{} -> localhost:{}", ts(), STATUS_LISTEN_PORT, HQP_CONTROL_PORT);
+            eprintln!("{} Status proxy: :{} -> {}:{}", ts(), status_listen_port, status_upstream_host, HQP_CONTROL_PORT);
 
             for stream in listener.incoming() {
                 let naa_conn = match stream {
@@ -180,7 +190,7 @@ fn main() {
                 let addr = naa_conn.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".into());
                 eprintln!("{} Status client connected from {}", ts(), addr);
 
-                let hqp_conn = match std::net::TcpStream::connect(("127.0.0.1", HQP_CONTROL_PORT)) {
+                let hqp_conn = match std::net::TcpStream::connect((&*status_upstream_host, HQP_CONTROL_PORT)) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("{} Status HQP connect failed: {}", ts(), e);
@@ -223,6 +233,9 @@ fn main() {
             }
         })
         .unwrap();
+    } else {
+        eprintln!("{} Status proxy: disabled (no [iptables] or hqp_host configured)", ts());
+    }
 
     let listener = std::net::TcpListener::bind(("0.0.0.0", naa_port)).unwrap();
     eprintln!(

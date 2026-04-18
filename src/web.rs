@@ -71,7 +71,8 @@ impl WebServer {
         // Parse method and path.
         let mut parts = request_line.splitn(3, ' ');
         let method = parts.next().unwrap_or("").to_string();
-        let path = parts.next().unwrap_or("").to_string();
+        let raw_path = parts.next().unwrap_or("");
+        let path = raw_path.split('?').next().unwrap_or("").to_string();
 
         // Read headers, capture Content-Length.
         let mut content_length: usize = 0;
