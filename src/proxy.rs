@@ -248,15 +248,32 @@ impl FrameProcessor {
     }
 }
 
+/// Find the end of an XML message in the buffer. Returns the index past
+/// the closing `</networkaudio>` tag (plus trailing newline if present).
+/// Falls back to the full buffer length if no closing tag is found.
+pub(crate) fn find_xml_end(data: &[u8]) -> usize {
+    const TAG: &[u8] = b"</networkaudio>";
+    if let Some(pos) = data.windows(TAG.len()).position(|w| w == TAG) {
+        let end = pos + TAG.len();
+        if end < data.len() && data[end] == b'\n' {
+            end + 1
+        } else {
+            end
+        }
+    } else {
+        data.len()
+    }
+}
+
 /// Handle XML data: log it, check for start messages, reset state, forward to dst.
 fn handle_xml(
     proc: &mut FrameProcessor,
-    data: &[u8],
+    xml: &[u8],
     dst: &mut TcpStream,
     label: &str,
 ) -> io::Result<()> {
-    log_xml(label, data);
-    if let Some(params) = parse_start_message(data) {
+    log_xml(label, xml);
+    if let Some(params) = parse_start_message(xml) {
         eprintln!(
             "{} [{}] start: {} bytes/sample, {} {}Hz",
             ts(),
@@ -267,7 +284,7 @@ fn handle_xml(
         );
         proc.reset_for_start(params);
     }
-    dst.write_all(data)
+    dst.write_all(xml)
 }
 
 /// Forward HQP->NAA: frame-level processing with metadata injection.
@@ -296,26 +313,38 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
         };
         let data = &buf[..n];
 
-        // Top-of-buffer XML check (before any frame processing)
+        let mut pos = 0;
+
+        // Top-of-buffer XML check (before any frame processing).
+        // Only forward the XML portion — any trailing binary bytes
+        // in the same TCP read must go through frame processing,
+        // otherwise HQP's raw META ("Roon") leaks through to the DAC.
         if proc.ops.is_empty() && proc.header_buf.is_empty() {
             if let Some(idx) = data.iter().position(|&b| !b.is_ascii_whitespace()) {
                 if data[idx] == b'<' {
-                    if let Err(e) = handle_xml(&mut proc, data, &mut dst, label) {
+                    let xml_end = find_xml_end(data);
+                    if let Err(e) = handle_xml(&mut proc, &data[..xml_end], &mut dst, label) {
                         eprintln!("{} [{}] write error: {}", ts(), label, e);
                         break;
                     }
-                    continue;
+                    if xml_end >= data.len() {
+                        continue;
+                    }
+                    eprintln!(
+                        "{} [{}] XML + {} trailing binary bytes in same read",
+                        ts(), label, data.len() - xml_end,
+                    );
+                    pos = xml_end;
                 }
             }
         }
 
-        let mut pos = 0;
         out.clear();
 
         while pos < data.len() {
             // If we have no pending ops, we're accumulating a header.
             if proc.ops.is_empty() {
-                // Mid-buffer XML check
+                // Mid-buffer XML check — forward only the XML portion.
                 if proc.header_buf.is_empty() && data[pos] == b'<' {
                     if !out.is_empty() {
                         if let Err(e) = dst.write_all(&out) {
@@ -324,11 +353,19 @@ pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: Shared
                         }
                         out.clear();
                     }
-                    if let Err(e) = handle_xml(&mut proc, &data[pos..], &mut dst, label) {
+                    let xml_end = pos + find_xml_end(&data[pos..]);
+                    if let Err(e) = handle_xml(&mut proc, &data[pos..xml_end], &mut dst, label) {
                         eprintln!("{} [{}] write error: {}", ts(), label, e);
                         return;
                     }
-                    break; // rest of buffer handled by XML path
+                    if xml_end < data.len() {
+                        eprintln!(
+                            "{} [{}] mid-buffer XML + {} trailing binary bytes",
+                            ts(), label, data.len() - xml_end,
+                        );
+                    }
+                    pos = xml_end;
+                    continue;
                 }
 
                 // Accumulate header bytes (32 total)

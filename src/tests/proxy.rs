@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::frame::{FrameHeader, StreamParams, FRAME_HEADER_SIZE, TYPE_META, TYPE_PIC, TYPE_POS};
 use crate::metadata::{Metadata, PlayState, SharedMetadata};
-use crate::proxy::{FrameOp, FrameProcessor};
+use crate::proxy::{find_xml_end, FrameOp, FrameProcessor};
 
 const PCM: StreamParams = StreamParams { bits: 32, rate: 44100, is_dsd: false, bytes_per_sample: 4 };
 const DSD: StreamParams = StreamParams { bits: 1, rate: 2822400, is_dsd: true, bytes_per_sample: 1 };
@@ -389,4 +389,33 @@ fn emits_both_slots_when_both_keys_change() {
     // Three emits: pos section + meta section + cover bytes.
     let emits = proc.ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
     assert_eq!(emits, 3);
+}
+
+// --- XML boundary detection ---
+
+#[test]
+fn find_xml_end_complete_message() {
+    let xml = b"<?xml version=\"1.0\"?><networkaudio><operation type=\"start\"/></networkaudio>\n";
+    assert_eq!(find_xml_end(xml), xml.len());
+}
+
+#[test]
+fn find_xml_end_with_trailing_binary() {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"<?xml version=\"1.0\"?><networkaudio><operation type=\"start\"/></networkaudio>\n");
+    let xml_len = buf.len();
+    buf.extend_from_slice(&[0x1D, 0x00, 0x00, 0x00]); // binary frame header
+    assert_eq!(find_xml_end(&buf), xml_len);
+}
+
+#[test]
+fn find_xml_end_no_trailing_newline() {
+    let xml = b"<networkaudio><operation type=\"stop\"/></networkaudio>";
+    assert_eq!(find_xml_end(xml), xml.len());
+}
+
+#[test]
+fn find_xml_end_no_closing_tag() {
+    let data = b"<partial xml data";
+    assert_eq!(find_xml_end(data), data.len());
 }
