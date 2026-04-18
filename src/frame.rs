@@ -115,10 +115,7 @@ pub fn parse_start_message(xml: &[u8]) -> Option<StreamParams> {
     })
 }
 
-/// Extract an XML attribute value: ` name="value"` -> `value`.
-/// Space prefix prevents matching attribute name suffixes
-/// (e.g., searching for "rate" won't false-match "bitrate").
-fn extract_xml_attr(text: &str, name: &str) -> Option<String> {
+pub(crate) fn extract_xml_attr(text: &str, name: &str) -> Option<String> {
     let pattern = format!(" {}=\"", name);
     let start = text.find(&pattern)? + pattern.len();
     let end = text[start..].find('"')? + start;

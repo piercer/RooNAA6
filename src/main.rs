@@ -9,6 +9,8 @@ mod tests;
 
 use std::time::SystemTime;
 
+use discovery::NaaEndpoint;
+
 pub fn ts() -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -23,16 +25,92 @@ pub fn ts() -> String {
     )
 }
 
+/// Resolve which NAA endpoint to proxy based on config and discovery results.
+fn resolve_target(cfg: &config::NaaConfig, endpoints: &[NaaEndpoint]) -> NaaEndpoint {
+    let fallback = |host: &str, version: Option<&String>| NaaEndpoint {
+        name: host.to_string(),
+        version: version.cloned().unwrap_or_else(|| "naa".to_string()),
+        protocol: "6".to_string(),
+        trigger: "0".to_string(),
+        addr: format!("{host}:{}", discovery::NAA_PORT).parse().unwrap(),
+    };
+
+    // If target name is set, find it among discovered endpoints.
+    if let Some(ref target) = cfg.target {
+        if let Some(ep) = endpoints.iter().find(|e| e.name == *target) {
+            let mut ep = ep.clone();
+            if let Some(ref v) = cfg.version {
+                ep.version = v.clone();
+            }
+            return ep;
+        }
+        eprintln!("ERROR: target {:?} not found among discovered endpoints:", target);
+        for ep in endpoints {
+            eprintln!("  - {} ({})", ep.name, ep.addr.ip());
+        }
+        if let Some(ref host) = cfg.host {
+            eprintln!("Falling back to configured host={}", host);
+            return fallback(host, cfg.version.as_ref());
+        }
+        std::process::exit(1);
+    }
+
+    // No target name — use explicit host if set.
+    if let Some(ref host) = cfg.host {
+        if let Some(ep) = endpoints.iter().find(|e| e.addr.ip().to_string() == *host) {
+            let mut ep = ep.clone();
+            if let Some(ref v) = cfg.version {
+                ep.version = v.clone();
+            }
+            return ep;
+        }
+        return fallback(host, cfg.version.as_ref());
+    }
+
+    // No target, no host — use sole discovered endpoint.
+    match endpoints.len() {
+        0 => {
+            eprintln!("ERROR: no NAA endpoints discovered and no host configured");
+            std::process::exit(1);
+        }
+        1 => {
+            let mut ep = endpoints[0].clone();
+            eprintln!("{} auto-selected sole endpoint: {}", ts(), ep.name);
+            if let Some(ref v) = cfg.version {
+                ep.version = v.clone();
+            }
+            ep
+        }
+        _ => {
+            eprintln!("ERROR: multiple NAA endpoints discovered — set [naa] target to select one:");
+            for ep in endpoints {
+                eprintln!("  - {:?} ({})", ep.name, ep.addr.ip());
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let cfg = config::load();
 
     eprintln!("{} RooNAA6 starting", ts());
 
     let mcast_iface = cfg.naa.mcast_iface;
-    let naa_version = cfg.naa.version.clone();
+
+    // Discover NAA endpoints BEFORE starting the responder (avoids self-discovery).
+    let endpoints = discovery::discover_endpoints(mcast_iface);
+
+    let target = resolve_target(&cfg.naa, &endpoints);
+    let naa_host = target.addr.ip().to_string();
+    eprintln!(
+        "{} target: {} at {} (version={:?})",
+        ts(), target.name, naa_host, target.version,
+    );
+
     std::thread::Builder::new()
         .name("discovery".into())
-        .spawn(move || discovery::run(mcast_iface, naa_version))
+        .spawn(move || discovery::run(mcast_iface, target))
         .unwrap();
 
     let shared = metadata::SharedMetadata::new();
@@ -44,7 +122,6 @@ fn main() {
         .spawn(move || roon::run(shared_roon, &roon_cfg))
         .unwrap();
 
-    let naa_host = cfg.naa.host;
     let naa_port = discovery::NAA_PORT;
 
     // Status proxy: intercepts HQPlayer's control channel (port 4321)
