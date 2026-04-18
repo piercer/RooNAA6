@@ -8,8 +8,6 @@ Roon Core ──> HQPlayer ──> RooNAA6 proxy ──> NAA endpoint
                               └── Roon Core WebSocket (metadata)
 ```
 
-![RooNAA6 Web GUI](screenshots/gui.png)
-
 ## Disclaimer
 
 This software is **not affiliated with or supported by Signalyst** (the developer of HQPlayer). If you experience issues while using RooNAA6, disable the proxy and connect HQPlayer directly to your NAA endpoint before seeking support from Signalyst. Use at your own risk.
@@ -70,6 +68,8 @@ Open `http://<proxy-ip>:8080` in a browser. The GUI lets you:
 - Set the **Roon Core** address and **zone**
 - Enable the **Status Proxy** (see below)
 - **Save** configuration and **Restart** the service
+
+<p align="center"><img src="screenshots/gui.png" alt="RooNAA6 Configuration GUI" width="450"></p>
 
 ### 6. Select the proxy in HQPlayer
 
