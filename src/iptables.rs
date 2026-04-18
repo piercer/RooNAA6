@@ -9,49 +9,30 @@ fn validate_host(host: &str) -> Result<(), String> {
         .map_err(|_| format!("invalid IPv4 address: {}", host))
 }
 
-/// The iptables rule arguments (without the -C/-A/-D verb) as a shared constant.
-fn rule_args(naa_host: &str) -> Vec<String> {
-    vec![
-        "-t".into(), "nat".into(),
-        "PREROUTING".into(),
-        "-s".into(), naa_host.into(),
-        "-p".into(), "tcp".into(),
-        "--dport".into(), "4321".into(),
-        "-j".into(), "REDIRECT".into(),
-        "--to-port".into(), "14321".into(),
-    ]
+fn run_iptables(verb: &str, naa_host: &str) -> Result<std::process::Output, String> {
+    Command::new("/usr/sbin/iptables")
+        .args(["-t", "nat", verb, "PREROUTING"])
+        .args(["-s", naa_host])
+        .args(["-p", "tcp", "--dport", "4321"])
+        .args(["-j", "REDIRECT", "--to-port", "14321"])
+        .output()
+        .map_err(|e| format!("failed to run iptables: {}", e))
 }
 
-/// Returns true if the PREROUTING redirect rule already exists.
 pub fn check_rule(naa_host: &str) -> bool {
-    let mut args = vec!["-t".to_string(), "nat".to_string(), "-C".to_string()];
-    args.extend(rule_args(naa_host));
-    let status = Command::new("/usr/sbin/iptables")
-        .args(&args)
-        .status();
-    match status {
-        Ok(s) => s.success(),
-        Err(_) => false,
-    }
+    run_iptables("-C", naa_host)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
-/// Adds the PREROUTING redirect rule if it is not already present (idempotent).
 pub fn add_rule(naa_host: &str) -> Result<(), String> {
     validate_host(naa_host)?;
     if check_rule(naa_host) {
         eprintln!("{} [iptables] rule already present for {}", ts(), naa_host);
         return Ok(());
     }
-
-    let mut args = vec!["-t".to_string(), "nat".to_string(), "-A".to_string()];
-    args.extend(rule_args(naa_host));
-
     eprintln!("{} [iptables] adding rule for {}", ts(), naa_host);
-    let output = Command::new("/usr/sbin/iptables")
-        .args(&args)
-        .output()
-        .map_err(|e| format!("failed to run iptables: {}", e))?;
-
+    let output = run_iptables("-A", naa_host)?;
     if output.status.success() {
         eprintln!("{} [iptables] rule added for {}", ts(), naa_host);
         Ok(())
@@ -61,23 +42,14 @@ pub fn add_rule(naa_host: &str) -> Result<(), String> {
     }
 }
 
-/// Removes the PREROUTING redirect rule if it is present (idempotent).
 pub fn remove_rule(naa_host: &str) -> Result<(), String> {
     validate_host(naa_host)?;
     if !check_rule(naa_host) {
         eprintln!("{} [iptables] rule not present for {}, nothing to remove", ts(), naa_host);
         return Ok(());
     }
-
-    let mut args = vec!["-t".to_string(), "nat".to_string(), "-D".to_string()];
-    args.extend(rule_args(naa_host));
-
     eprintln!("{} [iptables] removing rule for {}", ts(), naa_host);
-    let output = Command::new("/usr/sbin/iptables")
-        .args(&args)
-        .output()
-        .map_err(|e| format!("failed to run iptables: {}", e))?;
-
+    let output = run_iptables("-D", naa_host)?;
     if output.status.success() {
         eprintln!("{} [iptables] rule removed for {}", ts(), naa_host);
         Ok(())
