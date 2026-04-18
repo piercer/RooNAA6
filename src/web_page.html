@@ -1,4 +1,688 @@
 <!DOCTYPE html>
-<html><head><title>RooNAA6</title></head>
-<body><h1>RooNAA6 — placeholder</h1></body>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RooNAA6</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      padding: 16px;
+    }
+
+    .container {
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    /* ── Header ── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 0 16px;
+    }
+
+    header h1 {
+      font-size: 20px;
+      font-weight: 700;
+      color: #fff;
+      letter-spacing: 0.04em;
+    }
+
+    /* ── Panels ── */
+    .panel {
+      background: #16213e;
+      border-radius: 8px;
+      padding: 20px;
+      margin-bottom: 12px;
+    }
+
+    .panel-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #888;
+      margin-bottom: 16px;
+    }
+
+    /* ── Now Playing ── */
+    .now-playing {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .cover-art {
+      width: 80px;
+      height: 80px;
+      border-radius: 4px;
+      flex-shrink: 0;
+      background: #0f3460;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    .cover-art img {
+      width: 80px;
+      height: 80px;
+      object-fit: cover;
+      border-radius: 4px;
+    }
+
+    .cover-placeholder {
+      font-size: 36px;
+      line-height: 1;
+      color: #2980b9;
+      user-select: none;
+    }
+
+    .track-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .track-title {
+      font-size: 16px;
+      font-weight: 600;
+      color: #fff;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .track-artist {
+      font-size: 14px;
+      color: #e0e0e0;
+      margin-top: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .track-album {
+      font-size: 12px;
+      color: #888;
+      margin-top: 4px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .nothing-playing {
+      font-style: italic;
+      color: #888;
+    }
+
+    /* ── Config rows ── */
+    .config-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .config-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .config-label {
+      color: #888;
+      font-size: 13px;
+      width: 108px;
+      flex-shrink: 0;
+    }
+
+    .config-control {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* ── Inputs ── */
+    input[type="text"],
+    input[type="number"],
+    select {
+      background: #0f3460;
+      border: 1px solid #2980b9;
+      border-radius: 4px;
+      color: #fff;
+      font-family: inherit;
+      font-size: 13px;
+      padding: 7px 10px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+
+    input[type="text"]:focus,
+    input[type="number"]:focus,
+    select:focus {
+      border-color: #5dade2;
+    }
+
+    input[type="text"].full,
+    select.full {
+      width: 100%;
+    }
+
+    input[type="number"].port {
+      width: 72px;
+    }
+
+    input[type="text"].host {
+      flex: 1;
+    }
+
+    select {
+      width: 100%;
+      cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%23888' d='M0 0l5 6 5-6z'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 10px center;
+      padding-right: 28px;
+    }
+
+    /* ── Toggle switch ── */
+    .toggle-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .toggle {
+      position: relative;
+      display: inline-block;
+      width: 48px;
+      height: 26px;
+      flex-shrink: 0;
+    }
+
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+      position: absolute;
+    }
+
+    .slider {
+      position: absolute;
+      inset: 0;
+      background: #0f3460;
+      border-radius: 26px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .slider::before {
+      content: "";
+      position: absolute;
+      height: 20px;
+      width: 20px;
+      left: 3px;
+      bottom: 3px;
+      background: #e0e0e0;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+
+    .toggle input:checked + .slider {
+      background: #27ae60;
+    }
+
+    .toggle input:checked + .slider::before {
+      transform: translateX(22px);
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: #c0392b;
+      flex-shrink: 0;
+      transition: background 0.2s, box-shadow 0.2s;
+    }
+
+    .status-dot.active {
+      background: #27ae60;
+      box-shadow: 0 0 6px #27ae60;
+    }
+
+    .toggle-label {
+      color: #888;
+      font-size: 13px;
+    }
+
+    /* ── Buttons ── */
+    button {
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      padding: 9px 18px;
+      transition: opacity 0.15s, filter 0.15s;
+    }
+
+    button:hover {
+      filter: brightness(1.1);
+    }
+
+    button:active {
+      filter: brightness(0.9);
+    }
+
+    .btn-primary {
+      background: #2980b9;
+      color: #fff;
+    }
+
+    .btn-danger {
+      background: #c0392b;
+      color: #fff;
+    }
+
+    .btn-warn {
+      background: #d35400;
+      color: #fff;
+    }
+
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid #888;
+      color: #888;
+    }
+
+    /* ── Flash messages ── */
+    .flash {
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 12px;
+      max-height: 0;
+      overflow: hidden;
+      padding: 0 16px;
+      transition: max-height 0.25s ease, padding 0.25s ease, opacity 0.25s ease;
+      opacity: 0;
+    }
+
+    .flash.visible {
+      max-height: 60px;
+      padding: 12px 16px;
+      opacity: 1;
+    }
+
+    .flash.success {
+      background: #1a3a28;
+      border: 1px solid #27ae60;
+      color: #2ecc71;
+    }
+
+    .flash.error {
+      background: #3a1a1a;
+      border: 1px solid #c0392b;
+      color: #e74c3c;
+    }
+
+    /* ── Footer ── */
+    footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-top: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+
+    <header>
+      <h1>RooNAA6</h1>
+      <button class="btn-danger" id="btn-shutdown">Shutdown GUI</button>
+    </header>
+
+    <!-- Now Playing -->
+    <div class="panel" id="panel-now-playing">
+      <div class="panel-title">Now Playing</div>
+      <div class="now-playing">
+        <div class="cover-art" id="cover-wrap">
+          <span class="cover-placeholder" id="cover-placeholder">&#9835;</span>
+          <img id="cover-img" src="" alt="Cover art" style="display:none">
+        </div>
+        <div class="track-info" id="track-info">
+          <div class="nothing-playing" id="nothing-playing">Nothing playing</div>
+          <div class="track-title" id="track-title" style="display:none"></div>
+          <div class="track-artist" id="track-artist" style="display:none"></div>
+          <div class="track-album" id="track-album" style="display:none"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Configuration -->
+    <div class="panel">
+      <div class="panel-title">Configuration</div>
+
+      <div class="config-row">
+        <span class="config-label">NAA Endpoint</span>
+        <div class="config-control">
+          <select id="naa-endpoint" class="full">
+            <option value="">— no endpoints discovered —</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="config-row">
+        <span class="config-label">Roon Core</span>
+        <div class="config-control">
+          <input type="text" class="host" id="roon-host" placeholder="host">
+          <span style="color:#888">:</span>
+          <input type="number" class="port" id="roon-port" min="1" max="65535" placeholder="9330">
+        </div>
+      </div>
+
+      <div class="config-row">
+        <span class="config-label">Roon Zone</span>
+        <div class="config-control">
+          <input type="text" class="full" id="roon-zone" placeholder="zone name">
+        </div>
+      </div>
+
+      <div class="config-row">
+        <span class="config-label">Status Proxy</span>
+        <div class="config-control">
+          <div class="toggle-wrap">
+            <label class="toggle">
+              <input type="checkbox" id="iptables-toggle">
+              <span class="slider"></span>
+            </label>
+            <span class="status-dot" id="status-dot"></span>
+            <span class="toggle-label" id="toggle-label">rule inactive</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="flash" class="flash"></div>
+
+    <footer>
+      <button class="btn-primary" id="btn-save">Save</button>
+      <button class="btn-warn" id="btn-restart">Restart Service</button>
+    </footer>
+
+  </div>
+
+  <script>
+    // ── State ──────────────────────────────────────────────────────────────────
+    var coverRevision = 0;
+    var lastTitle = null;
+    var statusTimer = null;
+
+    // ── DOM refs ───────────────────────────────────────────────────────────────
+    var elCoverWrap      = document.getElementById("cover-wrap");
+    var elCoverImg       = document.getElementById("cover-img");
+    var elCoverPlaceholder = document.getElementById("cover-placeholder");
+    var elNothingPlaying = document.getElementById("nothing-playing");
+    var elTrackTitle     = document.getElementById("track-title");
+    var elTrackArtist    = document.getElementById("track-artist");
+    var elTrackAlbum     = document.getElementById("track-album");
+    var elEndpoint       = document.getElementById("naa-endpoint");
+    var elRoonHost       = document.getElementById("roon-host");
+    var elRoonPort       = document.getElementById("roon-port");
+    var elRoonZone       = document.getElementById("roon-zone");
+    var elToggle         = document.getElementById("iptables-toggle");
+    var elDot            = document.getElementById("status-dot");
+    var elToggleLabel    = document.getElementById("toggle-label");
+    var elFlash          = document.getElementById("flash");
+    var elBtnSave        = document.getElementById("btn-save");
+    var elBtnRestart     = document.getElementById("btn-restart");
+    var elBtnShutdown    = document.getElementById("btn-shutdown");
+
+    // ── Flash ──────────────────────────────────────────────────────────────────
+    var flashTimer = null;
+    function showFlash(msg, type) {
+      if (flashTimer) { clearTimeout(flashTimer); flashTimer = null; }
+      elFlash.textContent = msg;
+      elFlash.className = "flash " + type + " visible";
+      if (type === "success") {
+        flashTimer = setTimeout(hideFlash, 5000);
+      }
+    }
+
+    function hideFlash() {
+      elFlash.className = "flash";
+      flashTimer = null;
+    }
+
+    // ── HTTP helpers ───────────────────────────────────────────────────────────
+    function httpGet(url, cb) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", url);
+      xhr.onload = function() {
+        cb(null, xhr.responseText, xhr.status);
+      };
+      xhr.onerror = function() {
+        cb("network error", null, 0);
+      };
+      xhr.send();
+    }
+
+    function httpPost(url, data, cb) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", url);
+      xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.onload = function() {
+        cb(null, xhr.responseText, xhr.status);
+      };
+      xhr.onerror = function() {
+        cb("network error", null, 0);
+      };
+      xhr.send(JSON.stringify(data));
+    }
+
+    function parseJson(text) {
+      try { return JSON.parse(text); } catch(e) { return null; }
+    }
+
+    // ── Now Playing ────────────────────────────────────────────────────────────
+    function updateStatus(data) {
+      var hasTitle = data && data.title && data.title.length > 0;
+
+      if (!hasTitle) {
+        elNothingPlaying.style.display = "";
+        elTrackTitle.style.display = "none";
+        elTrackArtist.style.display = "none";
+        elTrackAlbum.style.display = "none";
+        // Show placeholder, hide image
+        elCoverPlaceholder.style.display = "";
+        elCoverImg.style.display = "none";
+        lastTitle = null;
+        return;
+      }
+
+      elNothingPlaying.style.display = "none";
+
+      elTrackTitle.textContent = data.title || "";
+      elTrackTitle.style.display = "";
+
+      elTrackArtist.textContent = data.artist || "";
+      elTrackArtist.style.display = data.artist ? "" : "none";
+
+      elTrackAlbum.textContent = data.album || "";
+      elTrackAlbum.style.display = data.album ? "" : "none";
+
+      // Cover art: increment cache-bust revision when title changes
+      if (data.title !== lastTitle) {
+        lastTitle = data.title;
+        if (data.has_cover) {
+          coverRevision++;
+        }
+      }
+
+      if (data.has_cover) {
+        elCoverImg.src = "/api/cover?r=" + coverRevision;
+        elCoverImg.style.display = "";
+        elCoverPlaceholder.style.display = "none";
+      } else {
+        elCoverImg.style.display = "none";
+        elCoverPlaceholder.style.display = "";
+      }
+    }
+
+    function pollStatus() {
+      httpGet("/api/status", function(err, text) {
+        if (!err) {
+          var data = parseJson(text);
+          if (data) { updateStatus(data); }
+        }
+      });
+    }
+
+    // ── Config ─────────────────────────────────────────────────────────────────
+    function populateConfig(cfg) {
+      // NAA endpoint dropdown
+      var endpoints = cfg.endpoints || [];
+      var currentTarget = (cfg.naa && cfg.naa.target) ? cfg.naa.target : null;
+
+      // Clear existing options
+      while (elEndpoint.options.length > 0) { elEndpoint.remove(0); }
+
+      if (endpoints.length === 0) {
+        var opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "— no endpoints discovered —";
+        elEndpoint.appendChild(opt);
+      } else {
+        var selectedIdx = 0;
+        for (var i = 0; i < endpoints.length; i++) {
+          var ep = endpoints[i];
+          var opt = document.createElement("option");
+          opt.value = JSON.stringify({ name: ep.name, ip: ep.ip });
+          opt.textContent = ep.name + " (" + ep.ip + ")";
+          if (currentTarget && ep.name === currentTarget) {
+            selectedIdx = i;
+          }
+          elEndpoint.appendChild(opt);
+        }
+        elEndpoint.selectedIndex = selectedIdx;
+      }
+
+      // Roon fields
+      if (cfg.roon) {
+        elRoonHost.value = cfg.roon.host || "";
+        elRoonPort.value = cfg.roon.port || 9330;
+        elRoonZone.value = cfg.roon.zone || "";
+      }
+
+      // iptables toggle and status dot
+      if (cfg.iptables) {
+        var active = cfg.iptables.active;
+        setIptablesUI(active);
+        elToggle.checked = active;
+      }
+    }
+
+    function setIptablesUI(active) {
+      if (active) {
+        elDot.className = "status-dot active";
+        elToggleLabel.textContent = "rule active";
+      } else {
+        elDot.className = "status-dot";
+        elToggleLabel.textContent = "rule inactive";
+      }
+    }
+
+    function loadConfig() {
+      httpGet("/api/config", function(err, text, status) {
+        if (err || status !== 200) {
+          showFlash("Failed to load configuration.", "error");
+          return;
+        }
+        var cfg = parseJson(text);
+        if (cfg) { populateConfig(cfg); }
+      });
+    }
+
+    // ── Toggle iptables ────────────────────────────────────────────────────────
+    elToggle.addEventListener("change", function() {
+      var enable = elToggle.checked;
+      httpPost("/api/iptables", { enable: enable }, function(err, text, status) {
+        if (err || status !== 200) {
+          var data = parseJson(text);
+          var msg = (data && data.error) ? data.error : "iptables toggle failed";
+          showFlash(msg, "error");
+          // Revert toggle
+          elToggle.checked = !enable;
+          return;
+        }
+        var data = parseJson(text);
+        if (data) { setIptablesUI(data.active); }
+      });
+    });
+
+    // ── Save ───────────────────────────────────────────────────────────────────
+    elBtnSave.addEventListener("click", function() {
+      var endpointVal = elEndpoint.value;
+      var ep = endpointVal ? parseJson(endpointVal) : null;
+
+      var payload = {
+        naa: {
+          host: ep ? ep.ip : "",
+          target: ep ? ep.name : ""
+        },
+        roon: {
+          host: elRoonHost.value,
+          port: parseInt(elRoonPort.value, 10) || 9330,
+          zone: elRoonZone.value
+        }
+      };
+
+      httpPost("/api/save", payload, function(err, text, status) {
+        if (err || status !== 200) {
+          var data = parseJson(text);
+          var msg = (data && data.error) ? data.error : "Save failed";
+          showFlash(msg, "error");
+          return;
+        }
+        showFlash("Configuration saved. Restart to apply changes.", "success");
+      });
+    });
+
+    // ── Restart ────────────────────────────────────────────────────────────────
+    elBtnRestart.addEventListener("click", function() {
+      if (!confirm("This will restart the proxy and interrupt any active audio. Continue?")) {
+        return;
+      }
+      httpPost("/api/restart", {}, function(err, text, status) {
+        showFlash("Restarting...", "success");
+        setTimeout(function() { location.reload(); }, 3000);
+      });
+    });
+
+    // ── Shutdown ───────────────────────────────────────────────────────────────
+    elBtnShutdown.addEventListener("click", function() {
+      if (!confirm("Shut down the web GUI? You will need to edit config.toml to re-enable it.")) {
+        return;
+      }
+      httpPost("/api/shutdown", {}, function(err, text, status) {
+        document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;color:#888;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:16px;">GUI has been shut down</div>';
+      });
+    });
+
+    // ── Init ───────────────────────────────────────────────────────────────────
+    loadConfig();
+    pollStatus();
+    statusTimer = setInterval(pollStatus, 3000);
+  </script>
+</body>
 </html>
