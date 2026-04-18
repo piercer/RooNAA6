@@ -4,9 +4,27 @@ mcast_iface = "192.168.30.212" # Interface IP for multicast discovery
 # version = "eversolo naa"     # NAA version string HQPlayer keys off
                                 # (match whatever the real DAC reports;
                                 # default "eversolo naa")
+# hqp_host = "192.168.30.212" # HQPlayer IP — only needed when the proxy runs
+                                # on a different machine than HQP. Enables the
+                                # Status proxy to listen on port 4321 directly
+                                # (no iptables redirect needed).
 
 [roon]
 host = "192.168.30.23"        # IP of the Roon Core
 # port = 9330                 # Roon Core HTTP/WebSocket port (default: 9330)
 zone = "Einstein"             # Roon zone name to monitor
 token_file = "/etc/roonaa6/roon_token.json"
+
+[web]
+enable = false                # Set to true to start the configuration GUI
+# port = 8080                # Web GUI port (default: 8080)
+
+# Status proxy topology — use ONE of these approaches:
+#
+# Same machine as HQP (needs iptables):
+[iptables]
+enable = false                # Set to true to add the Status proxy iptables rule on startup
+naa_host = "192.168.30.109"   # NAA endpoint IP for the PREROUTING rule
+#
+# Different machine from HQP (no iptables needed):
+# Set hqp_host under [naa] instead — see above.
