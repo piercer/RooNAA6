@@ -61,6 +61,73 @@ pub(crate) fn execute_ops(
     }
 }
 
+/// Forward HQP Status XML to NAA, rewriting `song="Roon"` with the actual
+/// track title from Roon metadata so the DAC displays the correct info.
+pub fn forward_status_to_naa(
+    mut src: TcpStream,
+    mut dst: TcpStream,
+    shared: SharedMetadata,
+) {
+    let label = "Status->NAA";
+    let mut buf = [0u8; 4096];
+    let mut last_title = String::new();
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => {
+                eprintln!("{} [{}] EOF", ts(), label);
+                break;
+            }
+            Ok(n) => {
+                let data = &buf[..n];
+                let meta = shared.get();
+                if !meta.title.is_empty() {
+                    if let Some(rewritten) = rewrite_status_song(data, &meta.title) {
+                        if meta.title != last_title {
+                            eprintln!("{} [{}] song -> {}", ts(), label, meta.title);
+                            last_title.clone_from(&meta.title);
+                        }
+                        if let Err(e) = dst.write_all(&rewritten) {
+                            eprintln!("{} [{}] write error: {}", ts(), label, e);
+                            break;
+                        }
+                        continue;
+                    }
+                }
+                if let Err(e) = dst.write_all(data) {
+                    eprintln!("{} [{}] write error: {}", ts(), label, e);
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("{} [{}] read error: {}", ts(), label, e);
+                break;
+            }
+        }
+    }
+}
+
+fn rewrite_status_song(data: &[u8], title: &str) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(data).ok()?;
+    let pattern = "song=\"";
+    let song_pos = text.find(pattern)?;
+    let val_start = song_pos + pattern.len();
+    let val_end = val_start + text[val_start..].find('"')?;
+
+    let escaped = xml_escape_attr(title);
+    let mut result = Vec::with_capacity(data.len() + escaped.len());
+    result.extend_from_slice(&data[..val_start]);
+    result.extend_from_slice(escaped.as_bytes());
+    result.extend_from_slice(&data[val_end..]);
+    Some(result)
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Forward NAA->HQP: simple byte passthrough with XML logging.
 pub fn forward_passthrough(mut src: TcpStream, mut dst: TcpStream, label: &str) {
     let mut buf = [0u8; 65536];
@@ -171,20 +238,17 @@ impl FrameProcessor {
             _ => None,
         };
 
-        // --- META/PIC: strip HQP, emit META on every frame ---
-        // The T8 reverts the title to HQPlayer's "Roon" fallback within a
-        // few seconds if META goes quiet, so we re-emit the [metadata]
-        // section on every frame once Roon has populated a title. The
-        // section is ~256 bytes — trivial overhead at PCM frame rates.
-        // PIC is heavy (~50KB), so the cover only rides along when the
-        // track actually changes; the T8 holds it between sends.
+        // --- META/PIC: strip HQP, emit ours on content change ---
+        // HQPlayer's META (song=Roon) is unconditionally stripped.
+        // The Status proxy (port 4321) handles continuous display updates;
+        // the NAA META only needs to fire on track change.
         let meta_key: Option<(String, String, String)> = if meta.title.is_empty() {
             None
         } else {
             Some((meta.title.clone(), meta.artist.clone(), meta.album.clone()))
         };
         let content_changed = meta_key.is_some() && self.last_meta_key != meta_key;
-        let meta_section: Option<Vec<u8>> = if meta_key.is_some() {
+        let meta_section: Option<Vec<u8>> = if content_changed {
             Some(build_meta_section(
                 &self.params,
                 &meta.title,
@@ -208,8 +272,7 @@ impl FrameProcessor {
         }
 
         // --- Rewrite header ---
-        // Always strip every section the proxy owns; set bits/lengths back
-        // only for the sections we're actually emitting this frame.
+        // Strip all proxy-owned bits; set back only what we emit.
         header.type_mask &= !(TYPE_POS | TYPE_META | TYPE_PIC);
         header.pos_len = 0;
         header.meta_len = 0;

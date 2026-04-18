@@ -116,10 +116,10 @@ fn emits_meta_on_first_sight_when_title_known() {
 }
 
 #[test]
-fn reemits_meta_every_frame_without_cover_when_key_unchanged() {
-    // META text is re-sent on every frame once the title is known,
-    // so the T8 never reverts to HQPlayer's "Roon" fallback. Cover
-    // stays strictly change-driven — no re-send while the key holds.
+fn strips_hqp_meta_no_reemit_when_key_unchanged() {
+    // Once META has been emitted, subsequent frames with unchanged
+    // title should strip HQP's META without emitting a replacement.
+    // The T8 holds the last META we sent.
     let shared = SharedMetadata::new();
     seed_track(&shared, "Song", Some(&vec![0xFFu8; 40000]));
     let mut proc = FrameProcessor::new(shared);
@@ -127,20 +127,18 @@ fn reemits_meta_every_frame_without_cover_when_key_unchanged() {
     proc.last_meta_key = Some(("Song".into(), "Artist".into(), "Album".into()));
     proc.frame_count = 50;
 
-    // HQP sent META bytes — must be stripped, and replaced with ours.
+    // HQP sent META bytes — must be stripped, no replacement emitted.
     let mut h = header(0x01 | TYPE_META, 100, 0, 250, 0);
     proc.build_frame_ops(&mut h);
 
-    assert_ne!(h.type_mask & TYPE_META, 0);
-    assert_eq!(h.type_mask & TYPE_PIC, 0);
-    assert_eq!(h.pic_len, 0);
-    assert!(h.meta_len > 0);
+    assert_eq!(h.type_mask & TYPE_META, 0);
+    assert_eq!(h.meta_len, 0);
 
     let ops: Vec<_> = proc.ops.iter().collect();
     assert!(matches!(ops[0], FrameOp::Pass(n) if *n == 100 * 4));
     assert!(matches!(ops[1], FrameOp::Skip(250)));
     let emits = ops.iter().filter(|op| matches!(op, FrameOp::Emit(_))).count();
-    assert_eq!(emits, 1, "re-emit meta text only, no cover");
+    assert_eq!(emits, 0);
 }
 
 #[test]
