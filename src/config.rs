@@ -12,6 +12,8 @@ pub struct Config {
 pub struct NaaConfig {
     pub host: String,
     pub mcast_iface: Ipv4Addr,
+    #[serde(default = "default_naa_version")]
+    pub version: String,
 }
 
 #[derive(Deserialize)]
@@ -22,6 +24,10 @@ pub struct RoonConfig {
     pub zone: String,
     #[serde(default = "default_token_file")]
     pub token_file: String,
+}
+
+fn default_naa_version() -> String {
+    "eversolo naa".to_string()
 }
 
 fn default_roon_port() -> u16 {

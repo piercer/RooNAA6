@@ -29,9 +29,10 @@ fn main() {
     eprintln!("{} RooNAA6 starting", ts());
 
     let mcast_iface = cfg.naa.mcast_iface;
+    let naa_version = cfg.naa.version.clone();
     std::thread::Builder::new()
         .name("discovery".into())
-        .spawn(move || discovery::run(mcast_iface))
+        .spawn(move || discovery::run(mcast_iface, naa_version))
         .unwrap();
 
     let shared = metadata::SharedMetadata::new();

@@ -1,6 +1,9 @@
 [naa]
 host = "192.168.30.109"       # IP of the real NAA endpoint (e.g. Eversolo T8)
 mcast_iface = "192.168.30.212" # Interface IP for multicast discovery
+# version = "eversolo naa"     # NAA version string HQPlayer keys off
+                                # (match whatever the real DAC reports;
+                                # default "eversolo naa")
 
 [roon]
 host = "192.168.30.23"        # IP of the Roon Core

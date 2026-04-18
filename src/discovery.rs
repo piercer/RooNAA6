@@ -9,14 +9,25 @@ const MCAST_ADDRS: [Ipv4Addr; 2] = [
     Ipv4Addr::new(239, 192, 0, 199),
 ];
 
-const DISCOVER_RESPONSE: &[u8] = b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+/// Build the discover response XML with a configurable version string.
+/// The `version` field is an opaque identifier that HQPlayer keys off to
+/// decide which NAA dialect to speak — it must match whatever the real
+/// DAC reports. Default is "eversolo naa".
+fn build_discover_response(version: &str) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
 <networkaudio>\
-<discover result=\"OK\" name=\"RooNAA6 Proxy\" version=\"eversolo naa\" protocol=\"6\" trigger=\"0\">\
+<discover result=\"OK\" name=\"RooNAA6 Proxy\" version=\"{}\" protocol=\"6\" trigger=\"0\">\
 network audio\
 </discover>\
-</networkaudio>\n";
+</networkaudio>\n",
+        version,
+    )
+    .into_bytes()
+}
 
-pub fn run(bind_addr: Ipv4Addr) {
+pub fn run(bind_addr: Ipv4Addr, version: String) {
+    let response = build_discover_response(&version);
     let sock = UdpSocket::bind(("0.0.0.0", NAA_PORT)).unwrap();
 
     for mcast in &MCAST_ADDRS {
@@ -26,10 +37,11 @@ pub fn run(bind_addr: Ipv4Addr) {
     }
 
     eprintln!(
-        "{} [discovery] listening on :{} (mcast on {})",
+        "{} [discovery] listening on :{} (mcast on {}, version={:?})",
         ts(),
         NAA_PORT,
-        bind_addr
+        bind_addr,
+        version,
     );
 
     let mut buf = [0u8; 4096];
@@ -41,7 +53,7 @@ pub fn run(bind_addr: Ipv4Addr) {
                     && data.windows(13).any(|w| w == b"network audio")
                 {
                     eprintln!("{} [discovery] responded to {}", ts(), addr);
-                    let _ = sock.send_to(DISCOVER_RESPONSE, &addr);
+                    let _ = sock.send_to(&response, &addr);
                 }
             }
             Err(e) => {
