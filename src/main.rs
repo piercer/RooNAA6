@@ -1,6 +1,7 @@
 mod config;
 mod discovery;
 mod frame;
+mod iptables;
 mod metadata;
 mod proxy;
 mod roon;
@@ -107,6 +108,14 @@ fn main() {
         "{} target: {} at {} (version={:?})",
         ts(), target.name, naa_host, target.version,
     );
+
+    if let Some(ref ipt_cfg) = cfg.iptables {
+        if ipt_cfg.enable {
+            if let Err(e) = iptables::add_rule(&ipt_cfg.naa_host) {
+                eprintln!("{} [iptables] failed to add rule: {}", ts(), e);
+            }
+        }
+    }
 
     std::thread::Builder::new()
         .name("discovery".into())
