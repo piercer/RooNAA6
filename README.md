@@ -31,8 +31,8 @@ This software is an independent, community-developed project and is **not affili
 Download the `.deb` package from the [releases page](https://github.com/piercer/RooNAA6/releases) and install it on the machine that will run the proxy (typically the same machine as HQPlayer):
 
 ```bash
-wget https://github.com/piercer/RooNAA6/releases/latest/download/roonaa6.deb
-sudo dpkg -i roonaa6.deb
+wget https://github.com/piercer/RooNAA6/releases/download/v2.0.0/roonaa6_2.0.0-1_amd64.deb
+sudo dpkg -i roonaa6_2.0.0-1_amd64.deb
 ```
 
 Or build from source (requires Rust toolchain) and install manually:
