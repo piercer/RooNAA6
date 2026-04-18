@@ -1,12 +1,15 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
+use std::time::Duration;
 
 use serde_json::json;
 
 use crate::discovery::NaaEndpoint;
 use crate::metadata::SharedMetadata;
 use crate::{config, iptables, ts};
+
+const MAX_BODY: usize = 64 * 1024;
 
 pub struct WebServer {
     pub shared: SharedMetadata,
@@ -28,6 +31,7 @@ impl WebServer {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut s) => {
+                    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
                     self.handle_request(&mut s);
                 }
                 Err(e) => {
@@ -72,6 +76,10 @@ impl WebServer {
         }
 
         // Read POST body if needed.
+        if content_length > MAX_BODY {
+            self.send_error(stream, "request body too large");
+            return;
+        }
         let body: Vec<u8> = if content_length > 0 {
             let mut buf = vec![0u8; content_length];
             use std::io::Read;
@@ -198,13 +206,13 @@ impl WebServer {
             }
         };
 
-        // Merge naa fields.
+        // Merge naa fields. Treat empty strings as None to avoid breaking resolve_target.
         if let Some(naa) = parsed.get("naa") {
             if let Some(v) = naa.get("host").and_then(|v| v.as_str()) {
-                cfg.naa.host = Some(v.to_string());
+                cfg.naa.host = if v.is_empty() { None } else { Some(v.to_string()) };
             }
             if let Some(v) = naa.get("target").and_then(|v| v.as_str()) {
-                cfg.naa.target = Some(v.to_string());
+                cfg.naa.target = if v.is_empty() { None } else { Some(v.to_string()) };
             }
         }
 

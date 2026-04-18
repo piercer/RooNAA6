@@ -1,6 +1,13 @@
+use std::net::Ipv4Addr;
 use std::process::Command;
 
 use crate::ts;
+
+fn validate_host(host: &str) -> Result<(), String> {
+    host.parse::<Ipv4Addr>()
+        .map(|_| ())
+        .map_err(|_| format!("invalid IPv4 address: {}", host))
+}
 
 /// The iptables rule arguments (without the -C/-A/-D verb) as a shared constant.
 fn rule_args(naa_host: &str) -> Vec<String> {
@@ -30,6 +37,7 @@ pub fn check_rule(naa_host: &str) -> bool {
 
 /// Adds the PREROUTING redirect rule if it is not already present (idempotent).
 pub fn add_rule(naa_host: &str) -> Result<(), String> {
+    validate_host(naa_host)?;
     if check_rule(naa_host) {
         eprintln!("{} [iptables] rule already present for {}", ts(), naa_host);
         return Ok(());
@@ -55,6 +63,7 @@ pub fn add_rule(naa_host: &str) -> Result<(), String> {
 
 /// Removes the PREROUTING redirect rule if it is present (idempotent).
 pub fn remove_rule(naa_host: &str) -> Result<(), String> {
+    validate_host(naa_host)?;
     if !check_rule(naa_host) {
         eprintln!("{} [iptables] rule not present for {}, nothing to remove", ts(), naa_host);
         return Ok(());

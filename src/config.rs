@@ -81,6 +81,10 @@ pub fn load_from(path: &str) -> Result<Config, String> {
 }
 
 pub fn save(path: &str, cfg: &Config) -> Result<(), String> {
+    let bak = format!("{}.bak", path);
+    if !std::path::Path::new(&bak).exists() && std::path::Path::new(path).exists() {
+        let _ = std::fs::copy(path, &bak);
+    }
     let text = toml::to_string(cfg).map_err(|e| format!("Failed to serialise config: {}", e))?;
     std::fs::write(path, text).map_err(|e| format!("Failed to write config file '{}': {}", path, e))
 }

@@ -671,7 +671,7 @@
 
     // ── Shutdown ───────────────────────────────────────────────────────────────
     elBtnShutdown.addEventListener("click", function() {
-      if (!confirm("Shut down the web GUI? You will need to edit config.toml to re-enable it.")) {
+      if (!confirm("Shut down the web GUI? This will also restart the proxy (audio will briefly interrupt). Edit config.toml to re-enable.")) {
         return;
       }
       httpPost("/api/shutdown", {}, function(err, text, status) {
