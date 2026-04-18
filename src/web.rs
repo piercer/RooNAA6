@@ -1,6 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -15,9 +16,19 @@ pub struct WebServer {
     pub shared: SharedMetadata,
     pub endpoints: Vec<NaaEndpoint>,
     pub config_path: String,
+    shutdown: AtomicBool,
 }
 
 impl WebServer {
+    pub fn new(shared: SharedMetadata, endpoints: Vec<NaaEndpoint>, config_path: String) -> Self {
+        Self {
+            shared,
+            endpoints,
+            config_path,
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
     pub fn run(&self, port: u16) {
         let listener = match TcpListener::bind(("0.0.0.0", port)) {
             Ok(l) => l,
@@ -29,19 +40,25 @@ impl WebServer {
         eprintln!("{} [web] listening on :{}", ts(), port);
 
         for stream in listener.incoming() {
+            if self.shutdown.load(Ordering::Relaxed) {
+                eprintln!("{} [web] shutting down", ts());
+                break;
+            }
             match stream {
                 Ok(mut s) => {
                     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                    self.handle_request(&mut s);
+                    self.handle_request(&mut s, port);
                 }
                 Err(e) => {
                     eprintln!("{} [web] accept error: {}", ts(), e);
                 }
             }
         }
+
+        eprintln!("{} [web] stopped", ts());
     }
 
-    fn handle_request(&self, stream: &mut TcpStream) {
+    fn handle_request(&self, stream: &mut TcpStream, port: u16) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
 
         // Read the request line.
@@ -99,7 +116,7 @@ impl WebServer {
             ("POST", "/api/save") => self.handle_post_save(stream, &body),
             ("POST", "/api/iptables") => self.handle_post_iptables(stream, &body),
             ("POST", "/api/restart") => self.handle_post_restart(stream),
-            ("POST", "/api/shutdown") => self.handle_post_shutdown(stream),
+            ("POST", "/api/shutdown") => self.handle_post_shutdown(stream, port),
             _ => {
                 self.send_response(stream, 404, "application/json", b"{\"error\":\"not found\"}");
             }
@@ -307,7 +324,7 @@ impl WebServer {
             .spawn();
     }
 
-    fn handle_post_shutdown(&self, stream: &mut TcpStream) {
+    fn handle_post_shutdown(&self, stream: &mut TcpStream, port: u16) {
         let cfg = match config::load_from(&self.config_path) {
             Ok(c) => c,
             Err(e) => {
@@ -316,7 +333,6 @@ impl WebServer {
             }
         };
 
-        // Set web.enable = false and save.
         let mut cfg = cfg;
         if let Some(ref mut web) = cfg.web {
             web.enable = false;
@@ -329,7 +345,10 @@ impl WebServer {
 
         self.send_json(stream, &json!({"ok": true}));
         stream.flush().ok();
-        std::process::exit(0);
+
+        self.shutdown.store(true, Ordering::Relaxed);
+        // Poke the listener to unblock accept().
+        let _ = TcpStream::connect(("127.0.0.1", port));
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────

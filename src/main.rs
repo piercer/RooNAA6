@@ -130,11 +130,7 @@ fn main() {
             std::thread::Builder::new()
                 .name("web".into())
                 .spawn(move || {
-                    let server = web::WebServer {
-                        shared: web_shared,
-                        endpoints: web_endpoints,
-                        config_path: web_config_path,
-                    };
+                    let server = web::WebServer::new(web_shared, web_endpoints, web_config_path);
                     server.run(web_port);
                 })
                 .unwrap();
