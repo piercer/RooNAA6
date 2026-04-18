@@ -130,11 +130,17 @@ impl WebServer {
 
     fn handle_get_status(&self, stream: &mut TcpStream) {
         let meta = self.shared.get();
+        let playing = match meta.play_state {
+            Some(crate::metadata::PlayState::Playing) => true,
+            Some(crate::metadata::PlayState::Paused) => true,
+            _ => false,
+        };
         let val = json!({
-            "title": meta.title,
-            "artist": meta.artist,
-            "album": meta.album,
-            "has_cover": meta.cover_art.is_some(),
+            "title": if playing { &meta.title } else { "" },
+            "artist": if playing { &meta.artist } else { "" },
+            "album": if playing { &meta.album } else { "" },
+            "has_cover": playing && meta.cover_art.is_some(),
+            "playing": playing,
         });
         self.send_json(stream, &val);
     }
@@ -173,6 +179,8 @@ impl WebServer {
             })
             .collect();
 
+        let zones = self.shared.get_zones();
+
         let val = json!({
             "naa": {
                 "host": cfg.naa.host,
@@ -190,6 +198,7 @@ impl WebServer {
                 "active": active,
             },
             "endpoints": endpoints_val,
+            "zones": zones,
         });
         self.send_json(stream, &val);
     }

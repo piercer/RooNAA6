@@ -358,7 +358,7 @@
       <div class="now-playing">
         <div class="cover-art" id="cover-wrap">
           <span class="cover-placeholder" id="cover-placeholder">&#9835;</span>
-          <img id="cover-img" src="" alt="Cover art" style="display:none">
+          <img id="cover-img" src="" alt="Cover art" style="display:none" onerror="this.style.display='none';document.getElementById('cover-placeholder').style.display=''">
         </div>
         <div class="track-info" id="track-info">
           <div class="nothing-playing" id="nothing-playing">Nothing playing</div>
@@ -394,7 +394,7 @@
       <div class="config-row">
         <span class="config-label">Roon Zone</span>
         <div class="config-control">
-          <input type="text" class="full" id="roon-zone" placeholder="zone name">
+          <select id="roon-zone" class="full"></select>
         </div>
       </div>
 
@@ -496,9 +496,9 @@
 
     // ── Now Playing ────────────────────────────────────────────────────────────
     function updateStatus(data) {
-      var hasTitle = data && data.title && data.title.length > 0;
+      var playing = data && data.playing && data.title && data.title.length > 0;
 
-      if (!hasTitle) {
+      if (!playing) {
         elNothingPlaying.style.display = "";
         elTrackTitle.style.display = "none";
         elTrackArtist.style.display = "none";
@@ -581,7 +581,35 @@
       if (cfg.roon) {
         elRoonHost.value = cfg.roon.host || "";
         elRoonPort.value = cfg.roon.port || 9330;
-        elRoonZone.value = cfg.roon.zone || "";
+
+        // Zone dropdown
+        var currentZone = cfg.roon.zone || "";
+        var zones = cfg.zones || [];
+        while (elRoonZone.options.length > 0) { elRoonZone.remove(0); }
+        var zoneFound = false;
+        for (var i = 0; i < zones.length; i++) {
+          var opt = document.createElement("option");
+          opt.value = zones[i];
+          opt.textContent = zones[i];
+          if (zones[i] === currentZone) {
+            opt.selected = true;
+            zoneFound = true;
+          }
+          elRoonZone.appendChild(opt);
+        }
+        if (!zoneFound && currentZone) {
+          var opt = document.createElement("option");
+          opt.value = currentZone;
+          opt.textContent = currentZone;
+          opt.selected = true;
+          elRoonZone.insertBefore(opt, elRoonZone.firstChild);
+        }
+        if (elRoonZone.options.length === 0) {
+          var opt = document.createElement("option");
+          opt.value = "";
+          opt.textContent = "— waiting for Roon —";
+          elRoonZone.appendChild(opt);
+        }
       }
 
       // iptables toggle and status dot

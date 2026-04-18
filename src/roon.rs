@@ -134,6 +134,21 @@ fn run_once(
             .and_then(|v| v.as_array());
 
         if let Some(zones) = zones {
+            let names: Vec<String> = zones
+                .iter()
+                .filter_map(|z| json_str(z, "display_name").map(|s| s.to_string()))
+                .collect();
+            if !names.is_empty() {
+                let mut all = shared.get_zones();
+                for name in &names {
+                    if !all.contains(name) {
+                        all.push(name.clone());
+                    }
+                }
+                all.sort();
+                shared.set_zones(all);
+            }
+
             for zone in zones {
                 if json_str(zone, "display_name") != Some(cfg.zone.as_str()) {
                     continue;
