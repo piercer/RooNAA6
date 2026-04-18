@@ -1,6 +1,6 @@
 # RooNAA6
 
-Transparent proxy between HQPlayer and an NAA v6 endpoint (e.g. Eversolo T8), injecting Roon track metadata and cover art into the audio stream so the DAC displays what's playing.
+Transparent proxy between HQPlayer and an NAA v6 endpoint (e.g. Eversolo T8), injecting Roon track metadata and cover art into the audio stream so the NAA endpoint displays what's playing.
 
 ```
 Roon Core ──> HQPlayer ──> RooNAA6 proxy ──> NAA endpoint
@@ -73,7 +73,7 @@ Open `http://<proxy-ip>:8080` in a browser. The GUI lets you:
 
 ### 6. Select the proxy in HQPlayer
 
-In HQPlayer's device dropdown, select the proxy (it appears under the name of your NAA endpoint). Play music from Roon — metadata and cover art should appear on the DAC.
+In HQPlayer's device dropdown, select the proxy (it appears under the name of your NAA endpoint). Play music from Roon — metadata and cover art should appear on the NAA endpoint.
 
 ---
 
