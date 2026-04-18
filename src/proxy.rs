@@ -352,10 +352,9 @@ fn handle_xml(
 
 /// Forward HQP->NAA: frame-level processing with metadata injection.
 ///
-/// Processes NAA v6 binary frames, injecting Roon metadata and cover art
-/// into the audio stream so the DAC displays track info. See
-/// FrameProcessor::decide_action for the injection logic, and
-/// FrameProcessor::build_frame_ops for how each frame is shaped.
+/// Processes NAA v6 binary frames, stripping HQPlayer's metadata and
+/// injecting Roon track info (title/artist/album/cover/position).
+/// See FrameProcessor::build_frame_ops for how each frame is shaped.
 pub fn forward_hqp_to_naa(mut src: TcpStream, mut dst: TcpStream, shared: SharedMetadata) {
     let label = "HQP->NAA";
     let mut buf = [0u8; 65536];
