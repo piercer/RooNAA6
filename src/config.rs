@@ -72,6 +72,14 @@ pub fn load() -> Config {
     })
 }
 
+/// Load config from an explicit path, returning an error string on failure.
+pub fn load_from(path: &str) -> Result<Config, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read config file '{}': {}", path, e))?;
+    toml::from_str(&text)
+        .map_err(|e| format!("Failed to parse config file '{}': {}", path, e))
+}
+
 pub fn save(path: &str, cfg: &Config) -> Result<(), String> {
     let text = toml::to_string(cfg).map_err(|e| format!("Failed to serialise config: {}", e))?;
     std::fs::write(path, text).map_err(|e| format!("Failed to write config file '{}': {}", path, e))

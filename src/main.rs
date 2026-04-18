@@ -5,6 +5,7 @@ mod iptables;
 mod metadata;
 mod proxy;
 mod roon;
+mod web;
 #[cfg(test)]
 mod tests;
 
@@ -94,6 +95,7 @@ fn resolve_target(cfg: &config::NaaConfig, endpoints: &[NaaEndpoint]) -> NaaEndp
 
 fn main() {
     let cfg = config::load();
+    let config_path = config::config_path();
 
     eprintln!("{} RooNAA6 starting", ts());
 
@@ -117,12 +119,32 @@ fn main() {
         }
     }
 
+    let shared = metadata::SharedMetadata::new();
+
+    if let Some(ref web_cfg) = cfg.web {
+        if web_cfg.enable {
+            let web_port = web_cfg.port;
+            let web_shared = shared.clone();
+            let web_endpoints = endpoints.clone();
+            let web_config_path = config_path.clone();
+            std::thread::Builder::new()
+                .name("web".into())
+                .spawn(move || {
+                    let server = web::WebServer {
+                        shared: web_shared,
+                        endpoints: web_endpoints,
+                        config_path: web_config_path,
+                    };
+                    server.run(web_port);
+                })
+                .unwrap();
+        }
+    }
+
     std::thread::Builder::new()
         .name("discovery".into())
         .spawn(move || discovery::run(mcast_iface, target))
         .unwrap();
-
-    let shared = metadata::SharedMetadata::new();
 
     let roon_cfg = cfg.roon;
     let shared_roon = shared.clone();
