@@ -10,3 +10,11 @@ host = "192.168.30.23"        # IP of the Roon Core
 # port = 9330                 # Roon Core HTTP/WebSocket port (default: 9330)
 zone = "Einstein"             # Roon zone name to monitor
 token_file = "/etc/roonaa6/roon_token.json"
+
+[web]
+enable = false                # Set to true to start the configuration GUI
+# port = 8080                # Web GUI port (default: 8080)
+
+[iptables]
+enable = false                # Set to true to add the Status proxy iptables rule on startup
+naa_host = "192.168.30.109"   # NAA endpoint IP for the PREROUTING rule
