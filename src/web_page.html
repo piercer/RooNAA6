@@ -358,7 +358,7 @@
       <div class="now-playing">
         <div class="cover-art" id="cover-wrap">
           <span class="cover-placeholder" id="cover-placeholder">&#9835;</span>
-          <img id="cover-img" src="" alt="Cover art" style="display:none" onerror="this.style.display='none';document.getElementById('cover-placeholder').style.display=''">
+          <img id="cover-img" src="" alt="Cover art" style="display:none">
         </div>
         <div class="track-info" id="track-info">
           <div class="nothing-playing" id="nothing-playing">Nothing playing</div>
@@ -521,22 +521,31 @@
       elTrackAlbum.textContent = data.album || "";
       elTrackAlbum.style.display = data.album ? "" : "none";
 
-      // Cover art: increment cache-bust revision when title changes
-      if (data.title !== lastTitle) {
-        lastTitle = data.title;
-        if (data.has_cover) {
+      if (data.has_cover) {
+        if (data.title !== lastTitle) {
           coverRevision++;
         }
-      }
-
-      if (data.has_cover) {
-        elCoverImg.src = "/api/cover?r=" + coverRevision;
-        elCoverImg.style.display = "";
-        elCoverPlaceholder.style.display = "none";
+        var newSrc = "/api/cover?r=" + coverRevision;
+        if (elCoverImg.src !== location.origin + newSrc) {
+          elCoverImg.src = newSrc;
+        }
+        elCoverImg.onload = function() {
+          elCoverImg.style.display = "";
+          elCoverPlaceholder.style.display = "none";
+        };
+        elCoverImg.onerror = function() {
+          elCoverImg.style.display = "none";
+          elCoverPlaceholder.style.display = "";
+        };
+        if (elCoverImg.complete && elCoverImg.naturalWidth > 0) {
+          elCoverImg.style.display = "";
+          elCoverPlaceholder.style.display = "none";
+        }
       } else {
         elCoverImg.style.display = "none";
         elCoverPlaceholder.style.display = "";
       }
+      lastTitle = data.title;
     }
 
     function pollStatus() {
