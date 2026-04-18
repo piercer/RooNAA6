@@ -10,7 +10,17 @@ Roon Core ──> HQPlayer ──> RooNAA6 proxy ──> NAA endpoint
 
 ## Disclaimer
 
-This software is **not affiliated with or supported by Signalyst** (the developer of HQPlayer). If you experience issues while using RooNAA6, disable the proxy and connect HQPlayer directly to your NAA endpoint before seeking support from Signalyst. Use at your own risk.
+This software is an independent, community-developed project and is **not affiliated with, endorsed by, or supported by Signalyst** (the developer of HQPlayer) in any way. RooNAA6 is not an official Signalyst product or component.
+
+**By using this software, you acknowledge and agree to the following:**
+
+1. **No Signalyst support obligation.** Signalyst bears no responsibility for any issues arising from the use of this proxy. You must **not** contact Signalyst support for problems encountered while RooNAA6 is in use.
+
+2. **Troubleshooting procedure.** If you experience any issues with HQPlayer or your NAA endpoint while using RooNAA6, you must **first** disable the proxy and connect HQPlayer directly to your NAA endpoint. Only if the issue **persists without the proxy in the signal chain** should you seek support from Signalyst.
+
+3. **Use at your own risk.** This software is provided "as is", without warranty of any kind, express or implied. The authors accept no liability for any damage, data loss, or other adverse effects resulting from its use.
+
+4. **Not a Signalyst product.** All trademarks, including "HQPlayer" and "NAA", are the property of their respective owners. Their use here is purely for descriptive and interoperability purposes.
 
 ---
 
