@@ -26,7 +26,7 @@ fn rule_args(naa_host: &str) -> Vec<String> {
 pub fn check_rule(naa_host: &str) -> bool {
     let mut args = vec!["-t".to_string(), "nat".to_string(), "-C".to_string()];
     args.extend(rule_args(naa_host));
-    let status = Command::new("iptables")
+    let status = Command::new("/usr/sbin/iptables")
         .args(&args)
         .status();
     match status {
@@ -47,7 +47,7 @@ pub fn add_rule(naa_host: &str) -> Result<(), String> {
     args.extend(rule_args(naa_host));
 
     eprintln!("{} [iptables] adding rule for {}", ts(), naa_host);
-    let output = Command::new("iptables")
+    let output = Command::new("/usr/sbin/iptables")
         .args(&args)
         .output()
         .map_err(|e| format!("failed to run iptables: {}", e))?;
@@ -73,7 +73,7 @@ pub fn remove_rule(naa_host: &str) -> Result<(), String> {
     args.extend(rule_args(naa_host));
 
     eprintln!("{} [iptables] removing rule for {}", ts(), naa_host);
-    let output = Command::new("iptables")
+    let output = Command::new("/usr/sbin/iptables")
         .args(&args)
         .output()
         .map_err(|e| format!("failed to run iptables: {}", e))?;
