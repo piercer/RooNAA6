@@ -38,24 +38,19 @@ pub fn discover_endpoints(bind_addr: Ipv4Addr) -> Vec<NaaEndpoint> {
 
     let mut endpoints = Vec::new();
     let mut buf = [0u8; 4096];
-    loop {
-        match sock.recv_from(&mut buf) {
-            Ok((len, addr)) => {
-                if let Some(ep) = parse_discover_response(&buf[..len], addr) {
-                    if ep.name == PROXY_NAME {
-                        continue;
-                    }
-                    if endpoints.iter().any(|e: &NaaEndpoint| e.addr.ip() == ep.addr.ip()) {
-                        continue;
-                    }
-                    eprintln!(
-                        "{} [discovery] found: {} (version={:?}, protocol={}, addr={})",
-                        ts(), ep.name, ep.version, ep.protocol, ep.addr,
-                    );
-                    endpoints.push(ep);
-                }
+    while let Ok((len, addr)) = sock.recv_from(&mut buf) {
+        if let Some(ep) = parse_discover_response(&buf[..len], addr) {
+            if ep.name == PROXY_NAME {
+                continue;
             }
-            Err(_) => break,
+            if endpoints.iter().any(|e: &NaaEndpoint| e.addr.ip() == ep.addr.ip()) {
+                continue;
+            }
+            eprintln!(
+                "{} [discovery] found: {} (version={:?}, protocol={}, addr={})",
+                ts(), ep.name, ep.version, ep.protocol, ep.addr,
+            );
+            endpoints.push(ep);
         }
     }
 
@@ -124,7 +119,7 @@ pub fn run(bind_addr: Ipv4Addr, endpoint: NaaEndpoint) {
                     && data.windows(13).any(|w| w == b"network audio")
                 {
                     eprintln!("{} [discovery] responded to {}", ts(), addr);
-                    let _ = sock.send_to(&response, &addr);
+                    let _ = sock.send_to(&response, addr);
                 }
             }
             Err(e) => {

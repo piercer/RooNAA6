@@ -87,9 +87,8 @@ impl WebServer {
                 break;
             }
             let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                let val = lower["content-length:".len()..].trim();
-                content_length = val.parse().unwrap_or(0);
+            if let Some(val) = lower.strip_prefix("content-length:") {
+                content_length = val.trim().parse().unwrap_or(0);
             }
         }
 
@@ -131,11 +130,7 @@ impl WebServer {
 
     fn handle_get_status(&self, stream: &mut TcpStream) {
         let meta = self.shared.get();
-        let playing = match meta.play_state {
-            Some(crate::metadata::PlayState::Playing) => true,
-            Some(crate::metadata::PlayState::Paused) => true,
-            _ => false,
-        };
+        let playing = matches!(meta.play_state, Some(crate::metadata::PlayState::Playing) | Some(crate::metadata::PlayState::Paused));
         let val = json!({
             "title": if playing { &meta.title } else { "" },
             "artist": if playing { &meta.artist } else { "" },

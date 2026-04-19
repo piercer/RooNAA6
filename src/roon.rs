@@ -289,6 +289,8 @@ fn json_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
 
 // --- MOO protocol helpers ---
 
+type MooResponse = (String, HashMap<String, String>, Value);
+
 fn build_moo_message(first_line: &str, request_id: &str, body: Option<&[u8]>) -> Vec<u8> {
     let mut msg = format!("{}\nRequest-Id: {}\n", first_line, request_id);
     if let Some(content) = body {
@@ -308,8 +310,8 @@ fn build_moo_message(first_line: &str, request_id: &str, body: Option<&[u8]>) ->
     bytes
 }
 
-fn send_moo(ws: &mut WebSocket<TcpStream>, msg: Vec<u8>) -> Result<(), tungstenite::Error> {
-    ws.send(Message::Binary(msg.into()))
+fn send_moo(ws: &mut WebSocket<TcpStream>, msg: Vec<u8>) -> Result<(), Box<tungstenite::Error>> {
+    ws.send(Message::Binary(msg.into())).map_err(Box::new)
 }
 
 fn send_request(
@@ -320,7 +322,7 @@ fn send_request(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let rid = *reqid;
     *reqid += 1;
-    let content = body.map(|b| serde_json::to_vec(&b)).transpose()?;
+    let content = body.as_ref().map(serde_json::to_vec).transpose()?;
     let msg = build_moo_message(
         &format!("MOO/1 REQUEST {}", name),
         &rid.to_string(),
@@ -336,7 +338,7 @@ fn send_response(
     request_id: &str,
     body: Option<&Value>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let content = body.map(|b| serde_json::to_vec(b)).transpose()?;
+    let content = body.map(serde_json::to_vec).transpose()?;
     let msg = build_moo_message(
         &format!("MOO/1 {}", status),
         request_id,
@@ -348,7 +350,7 @@ fn send_response(
 
 fn recv_response(
     ws: &mut WebSocket<TcpStream>,
-) -> Result<(String, HashMap<String, String>, Value), Box<dyn std::error::Error>> {
+) -> Result<MooResponse, Box<dyn std::error::Error>> {
     loop {
         match ws.read()? {
             Message::Binary(d) => return Ok(parse_moo_response(&d)),
@@ -359,7 +361,7 @@ fn recv_response(
     }
 }
 
-fn parse_moo_response(data: &[u8]) -> (String, HashMap<String, String>, Value) {
+fn parse_moo_response(data: &[u8]) -> MooResponse {
     // Search raw bytes for header/body separator — avoids UTF-8 converting the entire message
     let sep = match data.windows(2).position(|w| w == b"\n\n") {
         Some(s) => s,
