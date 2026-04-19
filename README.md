@@ -32,11 +32,11 @@ Download the `.deb` package from the [releases page](https://github.com/piercer/
 
 ```bash
 # x86_64 (Intel/AMD)
-wget https://github.com/piercer/RooNAA6/releases/download/v2.0.0/roonaa6_2.0.0-1_amd64.deb
+wget https://github.com/piercer/RooNAA6/releases/download/v2.0.1/roonaa6_2.0.0-1_amd64.deb
 sudo dpkg -i roonaa6_2.0.0-1_amd64.deb
 
 # Raspberry Pi (ARM64)
-wget https://github.com/piercer/RooNAA6/releases/download/v2.0.0/roonaa6_2.0.0-1_arm64.deb
+wget https://github.com/piercer/RooNAA6/releases/download/v2.0.1/roonaa6_2.0.0-1_arm64.deb
 sudo dpkg -i roonaa6_2.0.0-1_arm64.deb
 ```
 
