@@ -179,7 +179,7 @@ pub(crate) fn apply_zone_update(
     port: u16,
     last_image_key: &mut String,
 ) {
-    let mut meta = shared.get();
+    let mut meta = (*shared.get()).clone();
 
     if let Some(np) = zone.get("now_playing") {
         let (title, artist, album) = extract_track_info(np);
@@ -258,7 +258,7 @@ pub(crate) fn apply_zones_seek(shared: &SharedMetadata, body: &Value) {
         return;
     };
 
-    let mut meta = shared.get();
+    let mut meta = (*shared.get()).clone();
     meta.seek_position = Some(seek);
     shared.set(meta);
 }

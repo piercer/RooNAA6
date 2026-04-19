@@ -201,9 +201,9 @@ impl WebServer {
 
     fn handle_get_cover(&self, stream: &mut TcpStream) {
         let meta = self.shared.get();
-        match meta.cover_art {
+        match &meta.cover_art {
             Some(arc) => {
-                self.send_response(stream, 200, "image/jpeg", &arc);
+                self.send_response(stream, 200, "image/jpeg", arc);
             }
             None => {
                 self.send_response(stream, 404, "application/json", b"{\"error\":\"no cover art\"}");

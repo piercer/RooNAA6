@@ -22,7 +22,7 @@ fn seed_track(shared: &SharedMetadata, title: &str, cover: Option<&[u8]>) {
 }
 
 fn seed_position(shared: &SharedMetadata, length: u32, seek: f64, state: PlayState) {
-    let mut m = shared.get();
+    let mut m = (*shared.get()).clone();
     m.length_seconds = Some(length);
     m.seek_position = Some(seek);
     m.play_state = Some(state);

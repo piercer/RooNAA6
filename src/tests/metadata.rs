@@ -12,7 +12,7 @@ fn metadata_default_is_empty() {
 #[test]
 fn shared_metadata_round_trip() {
     let shared = SharedMetadata::new();
-    let mut m = shared.get();
+    let mut m = (*shared.get()).clone();
     m.title = "Song".into();
     m.length_seconds = Some(100);
     m.seek_position = Some(0.0);
@@ -36,7 +36,7 @@ fn shared_metadata_partial_update_preserves_other_fields() {
         ..Metadata::default()
     });
 
-    let mut m = shared.get();
+    let mut m = (*shared.get()).clone();
     m.seek_position = Some(11.0);
     shared.set(m);
 

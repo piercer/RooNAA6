@@ -19,30 +19,31 @@ pub struct Metadata {
     pub tracks_total: u32,
 }
 
-/// Thread-safe shared metadata, read-optimised via RwLock.
+/// Thread-safe shared metadata, read-optimised via RwLock<Arc<Metadata>>.
 ///
-/// Cover art uses Arc<Vec<u8>> so get() clones the refcount (O(1))
-/// rather than copying the entire JPEG on every frame.
+/// Readers get a cheap Arc::clone (atomic refcount bump) instead of
+/// cloning strings and cover art on every audio frame.  Writers are
+/// rare (track changes, seek updates) and pay the full clone cost.
 #[derive(Clone)]
 pub struct SharedMetadata {
-    inner: Arc<RwLock<Metadata>>,
+    inner: Arc<RwLock<Arc<Metadata>>>,
     zones: Arc<RwLock<Vec<String>>>,
 }
 
 impl SharedMetadata {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Metadata::default())),
+            inner: Arc::new(RwLock::new(Arc::new(Metadata::default()))),
             zones: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    pub fn get(&self) -> Metadata {
-        self.inner.read().unwrap().clone()
+    pub fn get(&self) -> Arc<Metadata> {
+        Arc::clone(&self.inner.read().unwrap())
     }
 
     pub fn set(&self, meta: Metadata) {
-        *self.inner.write().unwrap() = meta;
+        *self.inner.write().unwrap() = Arc::new(meta);
     }
 
     pub fn get_zones(&self) -> Vec<String> {
